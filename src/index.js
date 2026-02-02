@@ -412,7 +412,13 @@ app.get('/kaldera/test', async (req, res) => {
 });
 
 // --- HTTP server + WebSocket for slot stream ---
-const server = http.createServer(app);
+// Don't pass WebSocket upgrade requests to Express (otherwise Express returns 404 for GET /kaldera/slots)
+const server = http.createServer((req, res) => {
+  if (req.url && req.url.split('?')[0] === '/kaldera/slots' && (req.headers.upgrade || '').toLowerCase() === 'websocket') {
+    return; // leave connection open so server emits 'upgrade' and wss handles it
+  }
+  app(req, res);
+});
 
 // Kaldera slot stream: WebSocket at path /kaldera/slots — streams { slot, status, parent } for each new slot (Phase 2)
 const wss = new WebSocketServer({ server, path: '/kaldera/slots' });
