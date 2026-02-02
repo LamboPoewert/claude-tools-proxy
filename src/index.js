@@ -1,8 +1,10 @@
 const express = require('express');
+const http = require('http');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
+const { WebSocketServer } = require('ws');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -361,9 +363,31 @@ app.post('/jupiter/swap', async (req, res) => {
   }
 });
 
+// --- Kaldera gRPC helpers ---
+function getKalderaEndpoint() {
+  if (!KALDERA_GRPC_URL || !KALDERA_X_TOKEN) return null;
+  const url = KALDERA_GRPC_URL.trim().replace(/\/$/, '');
+  let endpoint = url;
+  if (url.startsWith('grpc://')) {
+    const host = url.slice(7).split('/')[0].split(':')[0];
+    const port = url.slice(7).split('/')[0].includes(':') ? url.slice(7).split('/')[0].split(':')[1] : '50051';
+    endpoint = `${host}:${port}`;
+  } else if (url.startsWith('grpcs://') || url.startsWith('https://')) {
+    const scheme = url.startsWith('grpcs://') ? 'grpcs' : 'https';
+    const rest = url.startsWith('grpcs://') ? url.slice(8) : url.slice(8);
+    const hostPart = rest.split('/')[0];
+    const hasPort = hostPart.includes(':');
+    const h = hasPort ? hostPart.split(':')[0] : hostPart;
+    const port = hasPort ? hostPart.split(':')[1] : '443';
+    endpoint = `${scheme}://${h}:${port}`;
+  }
+  return { endpoint, token: KALDERA_X_TOKEN };
+}
+
 // Kaldera gRPC test — connect with x-token, call getSlot (unary) to verify connectivity
 app.get('/kaldera/test', async (req, res) => {
-  if (!KALDERA_GRPC_URL || !KALDERA_X_TOKEN) {
+  const cfg = getKalderaEndpoint();
+  if (!cfg) {
     return res.status(503).json({
       ok: false,
       error: 'Kaldera gRPC not configured. Set KALDERA_GRPC_URL and KALDERA_X_TOKEN in Railway.',
@@ -371,19 +395,7 @@ app.get('/kaldera/test', async (req, res) => {
   }
   try {
     const Client = (await import('@triton-one/yellowstone-grpc')).default;
-    const url = KALDERA_GRPC_URL.trim().replace(/\/$/, '');
-    // Client accepts full URL; https:// or grpcs:// use TLS (required from cloud e.g. Railway).
-    // Plain grpc:// often fails with "transport error" (port 50051 blocked or server requires TLS).
-    let endpoint = url;
-    if (url.startsWith('grpc://')) {
-      const host = url.slice(7).split('/')[0].split(':')[0];
-      const port = url.slice(7).split('/')[0].includes(':') ? url.slice(7).split('/')[0].split(':')[1] : '50051';
-      endpoint = `${host}:${port}`;
-    } else if (url.startsWith('grpcs://') || url.startsWith('https://')) {
-      // Keep full URL so client uses TLS (required from cloud; plain grpc:// often gives "transport error")
-      endpoint = url;
-    }
-    const client = new Client(endpoint, KALDERA_X_TOKEN, {
+    const client = new Client(cfg.endpoint, cfg.token, {
       'grpc.max_receive_message_length': 64 * 1024 * 1024,
     });
     await client.connect();
@@ -391,13 +403,82 @@ app.get('/kaldera/test', async (req, res) => {
     res.json({ ok: true, slot: String(slot) });
   } catch (err) {
     console.error('Kaldera gRPC test error:', err.message);
-    res.status(500).json({ ok: false, error: err.message });
+    const isH2 = /h2 protocol error|http2 error/i.test(err.message);
+    const hint = isH2
+      ? 'h2 protocol error = TLS works but this URL may not serve gRPC/HTTP2. Ask Constant K for the dedicated Yellowstone gRPC endpoint (e.g. different host or path).'
+      : 'Confirm with Constant K that gRPC is served at this URL (the https:// link may be for web/REST, not gRPC).';
+    res.status(500).json({ ok: false, error: err.message, hint });
   }
 });
 
+// --- HTTP server + WebSocket for slot stream ---
+const server = http.createServer(app);
+
+// Kaldera slot stream: WebSocket at path /kaldera/slots — streams { slot, status, parent } for each new slot (Phase 2)
+const wss = new WebSocketServer({ server, path: '/kaldera/slots' });
+wss.on('connection', async (ws) => {
+  const cfg = getKalderaEndpoint();
+  if (!cfg) {
+    ws.send(JSON.stringify({ error: 'Kaldera gRPC not configured' }));
+    ws.close();
+    return;
+  }
+  let stream = null;
+  let client = null;
+  try {
+    const { default: Client, CommitmentLevel } = await import('@triton-one/yellowstone-grpc');
+    client = new Client(cfg.endpoint, cfg.token, {
+      'grpc.max_receive_message_length': 64 * 1024 * 1024,
+    });
+    await client.connect();
+    stream = await client.subscribe();
+    // Subscribe to slots only (confirmed commitment)
+    const subscribeRequest = {
+      accounts: {},
+      slots: { slots: { filterByCommitment: true } },
+      transactions: {},
+      transactionsStatus: {},
+      blocks: {},
+      blocksMeta: {},
+      entry: {},
+      commitment: CommitmentLevel.CONFIRMED,
+      accountsDataSlice: [],
+      ping: { id: 1 },
+    };
+    stream.write(subscribeRequest);
+    stream.on('data', (update) => {
+      if (update.slot && ws.readyState === 1) {
+        ws.send(JSON.stringify({
+          slot: String(update.slot.slot),
+          status: update.slot.status,
+          parent: update.slot.parent ? String(update.slot.parent) : undefined,
+        }));
+      }
+    });
+    stream.on('error', (err) => {
+      console.error('Kaldera slot stream error:', err.message);
+      if (ws.readyState === 1) ws.send(JSON.stringify({ error: err.message }));
+    });
+    stream.on('end', () => {
+      if (ws.readyState === 1) ws.close();
+    });
+  } catch (err) {
+    console.error('Kaldera slot stream setup error:', err.message);
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify({ error: err.message }));
+      ws.close();
+    }
+    return;
+  }
+  ws.on('close', () => {
+    if (stream && typeof stream.destroy === 'function') stream.destroy();
+  });
+});
+
 // Start server (0.0.0.0 so Railway/containers can reach healthcheck)
-app.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Claude Tools Proxy running on port ${PORT}`);
   console.log(`   RPC: ${RPC_URL ? 'Constant K ✓' : 'NOT SET ✗ (set CONSTANTK_RPC_URL in env)'}`);
   console.log(`   Kaldera gRPC: ${KALDERA_GRPC_URL && KALDERA_X_TOKEN ? '✓' : 'NOT SET (optional: KALDERA_GRPC_URL, KALDERA_X_TOKEN)'}`);
+  console.log(`   Slot stream: wss://<host>/kaldera/slots`);
 });
