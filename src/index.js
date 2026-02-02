@@ -372,16 +372,16 @@ app.get('/kaldera/test', async (req, res) => {
   try {
     const Client = (await import('@triton-one/yellowstone-grpc')).default;
     const url = KALDERA_GRPC_URL.trim().replace(/\/$/, '');
+    // Client accepts full URL; https:// or grpcs:// use TLS (required from cloud e.g. Railway).
+    // Plain grpc:// often fails with "transport error" (port 50051 blocked or server requires TLS).
     let endpoint = url;
     if (url.startsWith('grpc://')) {
       const host = url.slice(7).split('/')[0].split(':')[0];
       const port = url.slice(7).split('/')[0].includes(':') ? url.slice(7).split('/')[0].split(':')[1] : '50051';
       endpoint = `${host}:${port}`;
     } else if (url.startsWith('grpcs://') || url.startsWith('https://')) {
-      const host = url.startsWith('grpcs://') ? url.slice(8).split('/')[0] : url.replace(/^https:\/\//, '').split('/')[0];
-      const port = host.includes(':') ? host.split(':')[1] : '443';
-      const h = host.includes(':') ? host.split(':')[0] : host;
-      endpoint = `${h}:${port}`;
+      // Keep full URL so client uses TLS (required from cloud; plain grpc:// often gives "transport error")
+      endpoint = url;
     }
     const client = new Client(endpoint, KALDERA_X_TOKEN, {
       'grpc.max_receive_message_length': 64 * 1024 * 1024,
