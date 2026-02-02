@@ -1,0 +1,19 @@
+{
+  "name": "claude-tools-proxy",
+  "version": "1.0.0",
+  "description": "Claude Tools Proxy - RPC, Jito bundle, and Helius forwarding for the bundler desktop app",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@triton-one/yellowstone-grpc": "^5.0.2",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "helmet": "^7.1.0"
+  }
+}
