@@ -570,6 +570,128 @@ app.get('/grpc/jito/status', (req, res) => {
   res.json(status);
 });
 
+// ============================================================================
+// YELLOWSTONE gRPC ENDPOINTS - Phase 2 Implementation
+// ============================================================================
+
+// GET /grpc/yellowstone/test - Test Yellowstone gRPC connection
+app.get('/grpc/yellowstone/test', async (req, res) => {
+  try {
+    const status = yellowstoneGrpc.getStatus();
+    if (!status.configured) {
+      return res.status(503).json({
+        ok: false,
+        error: 'Yellowstone gRPC not configured. Set KALDERA_GRPC_URL and KALDERA_X_TOKEN.',
+        ...status,
+      });
+    }
+    
+    const healthy = await yellowstoneGrpc.isHealthy();
+    const slot = healthy ? await yellowstoneGrpc.getSlot() : null;
+    
+    res.json({
+      ok: healthy,
+      slot: slot ? String(slot) : null,
+      ...status,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Yellowstone gRPC test error:', error.message);
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+      ...yellowstoneGrpc.getStatus(),
+    });
+  }
+});
+
+// GET /grpc/yellowstone/status - Get Yellowstone gRPC connection status
+app.get('/grpc/yellowstone/status', (req, res) => {
+  const status = yellowstoneGrpc.getStatus();
+  res.json(status);
+});
+
+// GET /grpc/blockhash - Get latest blockhash via gRPC (faster than RPC)
+app.get('/grpc/blockhash', async (req, res) => {
+  try {
+    const commitment = req.query.commitment === 'finalized' ? 2 : 1; // 1=CONFIRMED, 2=FINALIZED
+    const result = await yellowstoneGrpc.getLatestBlockhash(commitment);
+    
+    res.json({
+      blockhash: result.blockhash,
+      lastValidBlockHeight: String(result.lastValidBlockHeight),
+      slot: String(result.slot),
+      commitment: commitment === 2 ? 'finalized' : 'confirmed',
+      source: 'grpc',
+    });
+  } catch (error) {
+    console.error('gRPC blockhash error:', error.message);
+    yellowstoneGrpc.reconnect().catch(() => {});
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /grpc/slot - Get current slot via gRPC
+app.get('/grpc/slot', async (req, res) => {
+  try {
+    const commitment = req.query.commitment === 'finalized' ? 2 : 1;
+    const slot = await yellowstoneGrpc.getSlot(commitment);
+    
+    res.json({
+      slot: String(slot),
+      commitment: commitment === 2 ? 'finalized' : 'confirmed',
+      source: 'grpc',
+    });
+  } catch (error) {
+    console.error('gRPC slot error:', error.message);
+    yellowstoneGrpc.reconnect().catch(() => {});
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /grpc/block-height - Get current block height via gRPC
+app.get('/grpc/block-height', async (req, res) => {
+  try {
+    const commitment = req.query.commitment === 'finalized' ? 2 : 1;
+    const blockHeight = await yellowstoneGrpc.getBlockHeight(commitment);
+    
+    res.json({
+      blockHeight: String(blockHeight),
+      commitment: commitment === 2 ? 'finalized' : 'confirmed',
+      source: 'grpc',
+    });
+  } catch (error) {
+    console.error('gRPC block height error:', error.message);
+    yellowstoneGrpc.reconnect().catch(() => {});
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /grpc/blockhash/valid - Check if blockhash is valid via gRPC
+app.post('/grpc/blockhash/valid', async (req, res) => {
+  try {
+    const { blockhash } = req.body;
+    if (!blockhash) {
+      return res.status(400).json({ error: 'blockhash required' });
+    }
+    
+    const commitment = req.query.commitment === 'finalized' ? 2 : 1;
+    const result = await yellowstoneGrpc.isBlockhashValid(blockhash, commitment);
+    
+    res.json({
+      blockhash,
+      valid: result.valid,
+      slot: String(result.slot),
+      commitment: commitment === 2 ? 'finalized' : 'confirmed',
+      source: 'grpc',
+    });
+  } catch (error) {
+    console.error('gRPC blockhash valid error:', error.message);
+    yellowstoneGrpc.reconnect().catch(() => {});
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- Kaldera gRPC helpers ---
 function getKalderaEndpoint() {
   if (!KALDERA_GRPC_URL || !KALDERA_X_TOKEN) return null;
@@ -725,6 +847,187 @@ class JitoGrpcManager {
 // Singleton instance
 const jitoGrpc = new JitoGrpcManager();
 
+// --- Yellowstone gRPC Client Manager ---
+// Manages Yellowstone (Geyser) gRPC connections for streaming data
+class YellowstoneGrpcManager {
+  constructor() {
+    this.client = null;
+    this.isConnecting = false;
+    this.connectionPromise = null;
+    this.lastError = null;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 5;
+    this.reconnectDelay = 1000;
+    this.subscribers = new Map(); // ws -> { stream, type }
+  }
+
+  // Get endpoint configuration
+  getConfig() {
+    return getKalderaEndpoint();
+  }
+
+  // Get or create gRPC client connection
+  async getClient() {
+    if (this.client) return this.client;
+    if (this.isConnecting && this.connectionPromise) {
+      return this.connectionPromise;
+    }
+
+    this.isConnecting = true;
+    this.connectionPromise = this._connect();
+    
+    try {
+      const client = await this.connectionPromise;
+      this.isConnecting = false;
+      this.reconnectAttempts = 0;
+      return client;
+    } catch (err) {
+      this.isConnecting = false;
+      this.lastError = err;
+      throw err;
+    }
+  }
+
+  async _connect() {
+    const cfg = this.getConfig();
+    if (!cfg) {
+      throw new Error('Yellowstone gRPC not configured. Set KALDERA_GRPC_URL and KALDERA_X_TOKEN.');
+    }
+
+    console.log(`Connecting to Yellowstone gRPC: ${cfg.endpoint}`);
+    
+    try {
+      const Client = (await import('@triton-one/yellowstone-grpc')).default;
+      this.client = new Client(cfg.endpoint, cfg.token, {
+        'grpc.max_receive_message_length': 64 * 1024 * 1024,
+      });
+      await this.client.connect();
+      
+      // Test connection
+      const slot = await this.client.getSlot();
+      console.log(`Yellowstone gRPC connected successfully (slot: ${slot})`);
+      return this.client;
+    } catch (err) {
+      this.client = null;
+      console.error('Yellowstone gRPC connection error:', err.message);
+      throw err;
+    }
+  }
+
+  // Get latest blockhash via gRPC (faster than RPC)
+  async getLatestBlockhash(commitment = 1) { // 1 = CONFIRMED
+    const client = await this.getClient();
+    const result = await client.getLatestBlockhash(commitment);
+    return {
+      blockhash: result.blockhash,
+      lastValidBlockHeight: result.lastValidBlockHeight,
+      slot: result.slot,
+    };
+  }
+
+  // Get current slot via gRPC
+  async getSlot(commitment = 1) {
+    const client = await this.getClient();
+    return await client.getSlot(commitment);
+  }
+
+  // Get block height via gRPC
+  async getBlockHeight(commitment = 1) {
+    const client = await this.getClient();
+    return await client.getBlockHeight(commitment);
+  }
+
+  // Check if blockhash is valid
+  async isBlockhashValid(blockhash, commitment = 1) {
+    const client = await this.getClient();
+    const result = await client.isBlockhashValid(blockhash, commitment);
+    return {
+      valid: result.valid,
+      slot: result.slot,
+    };
+  }
+
+  // Create a subscription stream
+  async subscribe() {
+    const client = await this.getClient();
+    return await client.subscribe();
+  }
+
+  // Attempt reconnection with exponential backoff
+  async reconnect() {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.error('Max reconnect attempts reached for Yellowstone gRPC');
+      return null;
+    }
+    
+    this.client = null;
+    this.reconnectAttempts++;
+    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+    
+    console.log(`Reconnecting to Yellowstone gRPC in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+    
+    try {
+      return await this.getClient();
+    } catch (err) {
+      return this.reconnect();
+    }
+  }
+
+  // Check connection health
+  async isHealthy() {
+    try {
+      const client = await this.getClient();
+      await client.getSlot();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Get status info
+  getStatus() {
+    const cfg = this.getConfig();
+    return {
+      configured: !!cfg,
+      connected: !!this.client,
+      endpoint: cfg?.endpoint || null,
+      reconnectAttempts: this.reconnectAttempts,
+      lastError: this.lastError?.message || null,
+      activeSubscribers: this.subscribers.size,
+    };
+  }
+
+  // Clean up a subscriber
+  removeSubscriber(ws) {
+    const sub = this.subscribers.get(ws);
+    if (sub && sub.stream) {
+      try {
+        if (typeof sub.stream.destroy === 'function') {
+          sub.stream.destroy();
+        }
+      } catch {}
+    }
+    this.subscribers.delete(ws);
+  }
+
+  // Clean up all resources
+  cleanup() {
+    for (const [ws, sub] of this.subscribers) {
+      try {
+        if (sub.stream && typeof sub.stream.destroy === 'function') {
+          sub.stream.destroy();
+        }
+      } catch {}
+    }
+    this.subscribers.clear();
+    this.client = null;
+  }
+}
+
+// Singleton instance
+const yellowstoneGrpc = new YellowstoneGrpcManager();
+
 // Kaldera gRPC test — connect with x-token, call getSlot (unary) to verify connectivity
 app.get('/kaldera/test', async (req, res) => {
   const cfg = getKalderaEndpoint();
@@ -756,7 +1059,12 @@ app.get('/kaldera/test', async (req, res) => {
 // WebSocket paths we handle:
 // - /kaldera/slots: Yellowstone slot stream
 // - /grpc/jito/bundle-results: Jito bundle result stream
-const WS_PATHS = ['/kaldera/slots', '/grpc/jito/bundle-results'];
+const WS_PATHS = [
+  '/kaldera/slots',
+  '/grpc/jito/bundle-results',
+  '/grpc/subscribe/transactions',
+  '/grpc/subscribe/accounts',
+];
 
 const server = http.createServer((req, res) => {
   const path = req.url ? req.url.split('?')[0] : '';
@@ -773,6 +1081,12 @@ const wssSlots = new WebSocketServer({ server, path: '/kaldera/slots' });
 
 // Jito bundle results stream: WebSocket at path /grpc/jito/bundle-results
 const wssBundleResults = new WebSocketServer({ server, path: '/grpc/jito/bundle-results' });
+
+// Yellowstone transaction stream: WebSocket at path /grpc/subscribe/transactions
+const wssTransactions = new WebSocketServer({ server, path: '/grpc/subscribe/transactions' });
+
+// Yellowstone account stream: WebSocket at path /grpc/subscribe/accounts
+const wssAccounts = new WebSocketServer({ server, path: '/grpc/subscribe/accounts' });
 
 // --- Jito Bundle Results WebSocket Handler ---
 wssBundleResults.on('connection', async (ws) => {
@@ -869,6 +1183,305 @@ wssBundleResults.on('connection', async (ws) => {
   });
 });
 
+// --- Yellowstone Transaction Subscription WebSocket Handler ---
+// Subscribe to transactions by account addresses
+wssTransactions.on('connection', async (ws) => {
+  console.log('[WS] New transaction subscriber connected');
+  
+  const status = yellowstoneGrpc.getStatus();
+  if (!status.configured) {
+    ws.send(JSON.stringify({
+      error: 'Yellowstone gRPC not configured. Set KALDERA_GRPC_URL and KALDERA_X_TOKEN.',
+      type: 'config_error',
+    }));
+    ws.close();
+    return;
+  }
+
+  let stream = null;
+  let subscribed = false;
+
+  // Send instructions to client
+  ws.send(JSON.stringify({
+    type: 'connected',
+    message: 'Connected. Send a subscribe message to start receiving transactions.',
+    example: {
+      action: 'subscribe',
+      filter: {
+        accountInclude: ['wallet-pubkey-1', 'token-mint'],
+        accountExclude: [],
+        vote: false,
+        failed: false,
+      },
+      commitment: 'confirmed',
+    },
+  }));
+
+  ws.on('message', async (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      
+      if (msg.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong', timestamp: new Date().toISOString() }));
+        return;
+      }
+      
+      if (msg.action === 'subscribe' && !subscribed) {
+        const filter = msg.filter || {};
+        const commitment = msg.commitment === 'finalized' ? 2 : 1;
+        
+        try {
+          const { CommitmentLevel } = await import('@triton-one/yellowstone-grpc');
+          stream = await yellowstoneGrpc.subscribe();
+          
+          // Build subscription request
+          const subscribeRequest = {
+            accounts: {},
+            slots: {},
+            transactions: {
+              txSubscription: {
+                vote: filter.vote ?? false,
+                failed: filter.failed ?? false,
+                signature: filter.signature || undefined,
+                accountInclude: filter.accountInclude || [],
+                accountExclude: filter.accountExclude || [],
+                accountRequired: filter.accountRequired || [],
+              },
+            },
+            transactionsStatus: {},
+            blocks: {},
+            blocksMeta: {},
+            entry: {},
+            commitment: commitment === 2 ? CommitmentLevel.FINALIZED : CommitmentLevel.CONFIRMED,
+            accountsDataSlice: [],
+            ping: { id: 1 },
+          };
+          
+          stream.write(subscribeRequest);
+          subscribed = true;
+          
+          // Store for cleanup
+          yellowstoneGrpc.subscribers.set(ws, { stream, type: 'transactions' });
+          
+          ws.send(JSON.stringify({
+            type: 'subscribed',
+            message: 'Subscribed to transactions',
+            filter: subscribeRequest.transactions.txSubscription,
+            timestamp: new Date().toISOString(),
+          }));
+          
+          stream.on('data', (update) => {
+            if (update.transaction && ws.readyState === 1) {
+              const tx = update.transaction;
+              const txInfo = tx.transaction;
+              
+              // Convert signature bytes to base58
+              const bs58 = require('bs58');
+              const signature = txInfo?.signature ? bs58.encode(Buffer.from(txInfo.signature)) : null;
+              
+              ws.send(JSON.stringify({
+                type: 'transaction',
+                signature,
+                slot: String(tx.slot),
+                isVote: txInfo?.isVote || false,
+                index: txInfo?.index,
+                timestamp: new Date().toISOString(),
+              }));
+            }
+          });
+          
+          stream.on('error', (err) => {
+            console.error('[WS] Transaction stream error:', err.message);
+            if (ws.readyState === 1) {
+              ws.send(JSON.stringify({ error: err.message, type: 'stream_error' }));
+            }
+          });
+          
+          stream.on('end', () => {
+            if (ws.readyState === 1) {
+              ws.send(JSON.stringify({ type: 'stream_ended' }));
+              ws.close();
+            }
+          });
+          
+        } catch (err) {
+          console.error('[WS] Transaction subscribe error:', err.message);
+          ws.send(JSON.stringify({ error: err.message, type: 'subscribe_error' }));
+        }
+      }
+      
+      if (msg.action === 'unsubscribe' && subscribed) {
+        yellowstoneGrpc.removeSubscriber(ws);
+        stream = null;
+        subscribed = false;
+        ws.send(JSON.stringify({ type: 'unsubscribed', timestamp: new Date().toISOString() }));
+      }
+      
+    } catch (err) {
+      ws.send(JSON.stringify({ error: 'Invalid message format', type: 'parse_error' }));
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('[WS] Transaction subscriber disconnected');
+    yellowstoneGrpc.removeSubscriber(ws);
+  });
+});
+
+// --- Yellowstone Account Subscription WebSocket Handler ---
+// Subscribe to account changes by address or owner
+wssAccounts.on('connection', async (ws) => {
+  console.log('[WS] New account subscriber connected');
+  
+  const status = yellowstoneGrpc.getStatus();
+  if (!status.configured) {
+    ws.send(JSON.stringify({
+      error: 'Yellowstone gRPC not configured. Set KALDERA_GRPC_URL and KALDERA_X_TOKEN.',
+      type: 'config_error',
+    }));
+    ws.close();
+    return;
+  }
+
+  let stream = null;
+  let subscribed = false;
+
+  // Send instructions to client
+  ws.send(JSON.stringify({
+    type: 'connected',
+    message: 'Connected. Send a subscribe message to start receiving account updates.',
+    example: {
+      action: 'subscribe',
+      filter: {
+        account: ['account-pubkey-1', 'account-pubkey-2'],
+        owner: ['owner-program-id'],
+      },
+      commitment: 'confirmed',
+    },
+  }));
+
+  ws.on('message', async (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      
+      if (msg.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong', timestamp: new Date().toISOString() }));
+        return;
+      }
+      
+      if (msg.action === 'subscribe' && !subscribed) {
+        const filter = msg.filter || {};
+        const commitment = msg.commitment === 'finalized' ? 2 : 1;
+        
+        if (!filter.account?.length && !filter.owner?.length) {
+          ws.send(JSON.stringify({
+            error: 'At least one account or owner filter required',
+            type: 'validation_error',
+          }));
+          return;
+        }
+        
+        try {
+          const { CommitmentLevel } = await import('@triton-one/yellowstone-grpc');
+          stream = await yellowstoneGrpc.subscribe();
+          
+          // Build subscription request
+          const subscribeRequest = {
+            accounts: {
+              accountSubscription: {
+                account: filter.account || [],
+                owner: filter.owner || [],
+                filters: filter.filters || [],
+                nonemptyTxnSignature: filter.nonemptyTxnSignature ?? undefined,
+              },
+            },
+            slots: {},
+            transactions: {},
+            transactionsStatus: {},
+            blocks: {},
+            blocksMeta: {},
+            entry: {},
+            commitment: commitment === 2 ? CommitmentLevel.FINALIZED : CommitmentLevel.CONFIRMED,
+            accountsDataSlice: filter.dataSlice || [],
+            ping: { id: 1 },
+          };
+          
+          stream.write(subscribeRequest);
+          subscribed = true;
+          
+          // Store for cleanup
+          yellowstoneGrpc.subscribers.set(ws, { stream, type: 'accounts' });
+          
+          ws.send(JSON.stringify({
+            type: 'subscribed',
+            message: 'Subscribed to account updates',
+            filter: subscribeRequest.accounts.accountSubscription,
+            timestamp: new Date().toISOString(),
+          }));
+          
+          stream.on('data', (update) => {
+            if (update.account && ws.readyState === 1) {
+              const acc = update.account;
+              const info = acc.account;
+              
+              // Convert pubkey bytes to base58
+              const bs58 = require('bs58');
+              const pubkey = info?.pubkey ? bs58.encode(Buffer.from(info.pubkey)) : null;
+              const owner = info?.owner ? bs58.encode(Buffer.from(info.owner)) : null;
+              
+              ws.send(JSON.stringify({
+                type: 'account',
+                pubkey,
+                owner,
+                lamports: info?.lamports,
+                slot: String(acc.slot),
+                executable: info?.executable || false,
+                rentEpoch: info?.rentEpoch,
+                dataLength: info?.data?.length || 0,
+                isStartup: acc.isStartup || false,
+                timestamp: new Date().toISOString(),
+              }));
+            }
+          });
+          
+          stream.on('error', (err) => {
+            console.error('[WS] Account stream error:', err.message);
+            if (ws.readyState === 1) {
+              ws.send(JSON.stringify({ error: err.message, type: 'stream_error' }));
+            }
+          });
+          
+          stream.on('end', () => {
+            if (ws.readyState === 1) {
+              ws.send(JSON.stringify({ type: 'stream_ended' }));
+              ws.close();
+            }
+          });
+          
+        } catch (err) {
+          console.error('[WS] Account subscribe error:', err.message);
+          ws.send(JSON.stringify({ error: err.message, type: 'subscribe_error' }));
+        }
+      }
+      
+      if (msg.action === 'unsubscribe' && subscribed) {
+        yellowstoneGrpc.removeSubscriber(ws);
+        stream = null;
+        subscribed = false;
+        ws.send(JSON.stringify({ type: 'unsubscribed', timestamp: new Date().toISOString() }));
+      }
+      
+    } catch (err) {
+      ws.send(JSON.stringify({ error: 'Invalid message format', type: 'parse_error' }));
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('[WS] Account subscriber disconnected');
+    yellowstoneGrpc.removeSubscriber(ws);
+  });
+});
+
 // --- Kaldera Slot Stream WebSocket Handler ---
 wssSlots.on('connection', async (ws) => {
   const cfg = getKalderaEndpoint();
@@ -933,9 +1546,11 @@ wssSlots.on('connection', async (ws) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Claude Tools Proxy running on port ${PORT}`);
   console.log(`   RPC: ${RPC_URL ? 'Constant K ✓' : 'NOT SET ✗ (set CONSTANTK_RPC_URL in env)'}`);
-  console.log(`   Kaldera gRPC: ${KALDERA_GRPC_URL && KALDERA_X_TOKEN ? '✓' : 'NOT SET (optional: KALDERA_GRPC_URL, KALDERA_X_TOKEN)'}`);
+  console.log(`   Yellowstone gRPC: ${KALDERA_GRPC_URL && KALDERA_X_TOKEN ? '✓' : 'NOT SET (optional: KALDERA_GRPC_URL, KALDERA_X_TOKEN)'}`);
   console.log(`   Jito gRPC: ${JITO_BLOCK_ENGINE_URL}${JITO_AUTH_KEYPAIR ? ' (authenticated)' : ' (public)'}`);
   console.log(`   WebSocket streams:`);
-  console.log(`     - wss://<host>/kaldera/slots (Yellowstone slot stream)`);
+  console.log(`     - wss://<host>/kaldera/slots (slot updates)`);
   console.log(`     - wss://<host>/grpc/jito/bundle-results (Jito bundle results)`);
+  console.log(`     - wss://<host>/grpc/subscribe/transactions (transaction stream)`);
+  console.log(`     - wss://<host>/grpc/subscribe/accounts (account updates)`);
 });

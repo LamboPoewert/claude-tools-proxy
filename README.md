@@ -6,7 +6,11 @@ Solana RPC proxy with gRPC support for Jito bundles, Yellowstone streaming, and 
 
 - RPC proxy to Constant K
 - Jito bundle sending (HTTP + gRPC)
-- Yellowstone gRPC slot streaming
+- Yellowstone gRPC streaming:
+  - Slot updates
+  - Transaction subscriptions
+  - Account change subscriptions
+  - Fast blockhash retrieval
 - Jito gRPC bundle results streaming
 - Jupiter quote and swap proxy
 - Token metadata hosting
@@ -184,7 +188,55 @@ Get uploaded image.
 ```
 GET /kaldera/test
 ```
-Test Kaldera/Yellowstone gRPC connection.
+Test Kaldera/Yellowstone gRPC connection (legacy).
+
+```
+GET /grpc/yellowstone/test
+```
+Test Yellowstone gRPC connection health.
+
+```
+GET /grpc/yellowstone/status
+```
+Get Yellowstone gRPC connection status.
+
+```
+GET /grpc/blockhash?commitment=confirmed
+```
+Get latest blockhash via gRPC (faster than RPC).
+
+**Response:**
+```json
+{
+  "blockhash": "...",
+  "lastValidBlockHeight": "123456789",
+  "slot": "123456789",
+  "commitment": "confirmed",
+  "source": "grpc"
+}
+```
+
+```
+GET /grpc/slot?commitment=confirmed
+```
+Get current slot via gRPC.
+
+```
+GET /grpc/block-height?commitment=confirmed
+```
+Get current block height via gRPC.
+
+```
+POST /grpc/blockhash/valid
+```
+Check if blockhash is valid via gRPC.
+
+**Request:**
+```json
+{
+  "blockhash": "..."
+}
+```
 
 ## WebSocket Streams
 
@@ -217,6 +269,70 @@ Streams Jito bundle results in real-time.
 ```
 
 Status values: `finalized`, `processed`, `rejected`, `dropped`
+
+### Transaction Stream
+```
+wss://<host>/grpc/subscribe/transactions
+```
+Subscribe to transactions by account addresses.
+
+**Subscribe Message:**
+```json
+{
+  "action": "subscribe",
+  "filter": {
+    "accountInclude": ["wallet-pubkey", "token-mint"],
+    "accountExclude": [],
+    "vote": false,
+    "failed": false
+  },
+  "commitment": "confirmed"
+}
+```
+
+**Transaction Messages:**
+```json
+{
+  "type": "transaction",
+  "signature": "base58-signature",
+  "slot": "123456789",
+  "isVote": false,
+  "index": "0",
+  "timestamp": "2024-01-01T00:00:00.000Z"
+}
+```
+
+### Account Stream
+```
+wss://<host>/grpc/subscribe/accounts
+```
+Subscribe to account changes by address or owner.
+
+**Subscribe Message:**
+```json
+{
+  "action": "subscribe",
+  "filter": {
+    "account": ["account-pubkey-1", "account-pubkey-2"],
+    "owner": ["token-program-id"]
+  },
+  "commitment": "confirmed"
+}
+```
+
+**Account Update Messages:**
+```json
+{
+  "type": "account",
+  "pubkey": "base58-pubkey",
+  "owner": "base58-owner",
+  "lamports": "1000000000",
+  "slot": "123456789",
+  "executable": false,
+  "dataLength": 165,
+  "timestamp": "2024-01-01T00:00:00.000Z"
+}
+```
 
 ## Performance: gRPC vs HTTP
 

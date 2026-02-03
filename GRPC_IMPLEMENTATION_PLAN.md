@@ -232,13 +232,13 @@ const subscribeRequest = {
 - [x] **1.7** Add retry logic and error handling (exponential backoff reconnection)
 - [x] **1.8** Add connection health monitoring (`/grpc/jito/test`, `/grpc/jito/status`)
 
-### Phase 2: Yellowstone gRPC Enhancements (Priority: Medium)
+### Phase 2: Yellowstone gRPC Enhancements (Priority: Medium) ✅ COMPLETED
 
-- [ ] **2.1** Implement transaction subscription endpoint
-- [ ] **2.2** Implement account change subscription endpoint
-- [ ] **2.3** Add `/grpc/blockhash` endpoint
-- [ ] **2.4** Implement connection pooling for multiple subscribers
-- [ ] **2.5** Add subscription management (add/remove filters)
+- [x] **2.1** Implement transaction subscription endpoint (`/grpc/subscribe/transactions` WebSocket)
+- [x] **2.2** Implement account change subscription endpoint (`/grpc/subscribe/accounts` WebSocket)
+- [x] **2.3** Add `/grpc/blockhash` endpoint (+ `/grpc/slot`, `/grpc/block-height`, `/grpc/blockhash/valid`)
+- [x] **2.4** Implement connection pooling for multiple subscribers (`YellowstoneGrpcManager` class)
+- [x] **2.5** Add subscription management (subscribe/unsubscribe via WebSocket messages)
 
 ### Phase 3: Unified Trade Endpoints (Priority: Medium)
 
