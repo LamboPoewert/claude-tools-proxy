@@ -485,6 +485,26 @@ wss.on('connection', async (ws) => {
   });
 });
 
+// --- SOL/USD price cache (for real-time USD market cap) ---
+let solPriceUsd = { price: 0, ts: 0 };
+const SOL_PRICE_CACHE_MS = 30_000; // 30s — more frequent than desktop since proxy serves multiple clients
+
+async function fetchSolPrice() {
+  if (solPriceUsd.price > 0 && Date.now() - solPriceUsd.ts < SOL_PRICE_CACHE_MS) {
+    return solPriceUsd.price;
+  }
+  try {
+    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+    const data = await res.json();
+    const p = data?.solana?.usd;
+    if (typeof p === 'number' && p > 0) {
+      solPriceUsd = { price: p, ts: Date.now() };
+      return p;
+    }
+  } catch (e) { /* ignore */ }
+  return solPriceUsd.price || 0;
+}
+
 // --- Real-time positions: WebSocket at /ws/positions ---
 // Clients send: { type: 'subscribe', mints: ['mint1', 'mint2', ...] } or { type: 'unsubscribe', mints: [...] }
 // Server polls bonding curve PDAs via getMultipleAccounts every 1s and pushes price updates.
@@ -570,6 +590,9 @@ let positionsPollTimer = null;
 async function pollPositions() {
   if (allWatchedMints.size === 0 || !RPC_URL) return;
 
+  // Fetch SOL/USD price (cached, only hits API every 30s)
+  const solPrice = await fetchSolPrice();
+
   const mints = [...allWatchedMints];
 
   // Build PDA list (use cache or derive)
@@ -648,6 +671,8 @@ async function pollPositions() {
               mint,
               price,
               marketCapSol,
+              marketCapUsd: solPrice > 0 ? marketCapSol * solPrice : 0,
+              solPriceUsd: solPrice,
               virtualSol: virtualSolReserves / 1e9,
               virtualTokens: virtualTokenReserves / 1e6,
               realSol: realSolReserves / 1e9,
