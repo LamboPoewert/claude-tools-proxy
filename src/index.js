@@ -599,7 +599,7 @@ async function pollPositions() {
           const tokenTotalSupply = Number(data.readBigUInt64LE(40));
 
           const price = (virtualSolReserves / 1e9) / (virtualTokenReserves / 1e6);
-          const marketCapSol = virtualSolReserves / 1e9;
+          const marketCapSol = price * (tokenTotalSupply / 1e6);
 
           const cached = mintCache.get(mint);
           const prev = cached?.lastData;
