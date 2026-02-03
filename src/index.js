@@ -872,7 +872,117 @@ app.post('/grpc/balances', async (req, res) => {
 // GET /grpc/cache/stats - Get account cache statistics
 app.get('/grpc/cache/stats', (req, res) => {
   res.json(accountCache.getStats());
+});
+
+// --- Priority Fee Cache ---
+// Caches recent priority fees to avoid RPC calls
+const priorityFeeCache = {
+  fees: { min: 1000, low: 10000, medium: 50000, high: 200000, veryHigh: 500000 },
+  percentiles: {},
+  lastSlot: 0,
+  updatedAt: 0,
+  ttl: 10000, // 10 second cache
+};
+
+async function updatePriorityFeeCache() {
+  if (!RPC_URL) return;
+  
+  const now = Date.now();
+  if (now - priorityFeeCache.updatedAt < priorityFeeCache.ttl) {
+    return; // Still fresh
   }
+  
+  try {
+    const response = await fetch(RPC_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getRecentPrioritizationFees',
+        params: [],
+      }),
+    });
+    
+    const result = await response.json();
+    if (result.result && Array.isArray(result.result)) {
+      const fees = result.result
+        .map(f => f.prioritizationFee)
+        .filter(f => f > 0)
+        .sort((a, b) => a - b);
+      
+      if (fees.length > 0) {
+        priorityFeeCache.fees = {
+          min: fees[0] || 1000,
+          low: fees[Math.floor(fees.length * 0.25)] || 10000,
+          medium: fees[Math.floor(fees.length * 0.5)] || 50000,
+          high: fees[Math.floor(fees.length * 0.75)] || 200000,
+          veryHigh: fees[Math.floor(fees.length * 0.95)] || 500000,
+        };
+        priorityFeeCache.percentiles = {
+          p25: fees[Math.floor(fees.length * 0.25)],
+          p50: fees[Math.floor(fees.length * 0.5)],
+          p75: fees[Math.floor(fees.length * 0.75)],
+          p90: fees[Math.floor(fees.length * 0.9)],
+          p95: fees[Math.floor(fees.length * 0.95)],
+        };
+        priorityFeeCache.lastSlot = result.result[result.result.length - 1]?.slot || 0;
+      }
+    }
+    priorityFeeCache.updatedAt = now;
+  } catch (e) {
+    console.error('Priority fee cache update error:', e.message);
+  }
+}
+
+// Background refresh every 10 seconds
+setInterval(updatePriorityFeeCache, 10000);
+updatePriorityFeeCache(); // Initial fetch
+
+// GET /grpc/priority-fees - Get cached priority fee estimates
+app.get('/grpc/priority-fees', async (req, res) => {
+  // Ensure cache is fresh
+  await updatePriorityFeeCache();
+  
+  res.json({
+    fees: priorityFeeCache.fees,
+    percentiles: priorityFeeCache.percentiles,
+    lastSlot: priorityFeeCache.lastSlot,
+    updatedAt: priorityFeeCache.updatedAt,
+    source: 'cached',
+  });
+});
+
+// GET /grpc/optimal-fee - Get recommended fee for current conditions
+app.get('/grpc/optimal-fee', async (req, res) => {
+  const urgency = req.query.urgency || 'medium'; // low, medium, high, max
+  
+  await updatePriorityFeeCache();
+  
+  let recommended;
+  switch (urgency) {
+    case 'low':
+      recommended = priorityFeeCache.fees.low;
+      break;
+    case 'medium':
+      recommended = priorityFeeCache.fees.medium;
+      break;
+    case 'high':
+      recommended = priorityFeeCache.fees.high;
+      break;
+    case 'max':
+      recommended = priorityFeeCache.fees.veryHigh;
+      break;
+    default:
+      recommended = priorityFeeCache.fees.medium;
+  }
+  
+  res.json({
+    urgency,
+    microLamports: recommended,
+    lamports: Math.ceil(recommended * 200000 / 1e6), // Estimate for 200k CU
+    source: 'cached',
+  });
 });
 
 // ============================================================================
