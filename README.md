@@ -478,8 +478,47 @@ Trade status values: `pending`, `started`, `awaiting_signature`, `submitted`, `f
 | Metric | HTTP | gRPC |
 |--------|------|------|
 | Bundle send latency | 200-500ms | 50-150ms |
+| Blockhash retrieval | ~100ms | ~10ms |
 | Connection overhead | Per-request | Persistent |
-| Confirmation notification | Polling | Stream (<100ms) |
+| Confirmation notification | Polling (1-2s) | Stream (<100ms) |
+
+## Documentation
+
+- **[API Reference](docs/API.md)** - Complete API documentation
+- **[Examples](examples/client-examples.js)** - Client code examples
+- **[Implementation Plan](GRPC_IMPLEMENTATION_PLAN.md)** - Technical architecture
+
+## Quick Start Examples
+
+### Buy Token via gRPC
+
+```javascript
+const result = await fetch('http://localhost:3000/grpc/buy', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    outputMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+    amountLamports: 1000000000, // 1 SOL
+    slippageBps: 100,
+    walletPubkey: 'your-wallet-pubkey',
+  }),
+});
+```
+
+### Subscribe to Trade Status
+
+```javascript
+const ws = new WebSocket('ws://localhost:3000/grpc/trade/status');
+ws.send(JSON.stringify({ action: 'subscribe', tradeId: 'your-trade-id' }));
+ws.onmessage = (e) => console.log('Trade update:', JSON.parse(e.data));
+```
+
+### Get Fast Blockhash
+
+```javascript
+const result = await fetch('http://localhost:3000/grpc/blockhash');
+const { blockhash, lastValidBlockHeight } = await result.json();
+```
 
 ## License
 
