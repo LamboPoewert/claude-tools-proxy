@@ -221,16 +221,16 @@ const subscribeRequest = {
 
 ## Implementation Tasks
 
-### Phase 1: Jito gRPC Integration (Priority: High)
+### Phase 1: Jito gRPC Integration (Priority: High) ✅ COMPLETED
 
-- [ ] **1.1** Add `jito-ts` dependency ✅ (completed)
-- [ ] **1.2** Create Jito gRPC client wrapper service
-- [ ] **1.3** Implement `/grpc/jito/bundle` endpoint
-- [ ] **1.4** Implement `/grpc/jito/tip-accounts` endpoint
-- [ ] **1.5** Implement `/grpc/jito/leaders` endpoint
-- [ ] **1.6** Implement `/grpc/jito/bundle-results` WebSocket
-- [ ] **1.7** Add retry logic and error handling
-- [ ] **1.8** Add connection health monitoring
+- [x] **1.1** Add `jito-ts` dependency
+- [x] **1.2** Create Jito gRPC client wrapper service (`JitoGrpcManager` class)
+- [x] **1.3** Implement `/grpc/jito/bundle` endpoint
+- [x] **1.4** Implement `/grpc/jito/tip-accounts` endpoint
+- [x] **1.5** Implement `/grpc/jito/leaders` endpoint (+ `/grpc/jito/next-leader`)
+- [x] **1.6** Implement `/grpc/jito/bundle-results` WebSocket
+- [x] **1.7** Add retry logic and error handling (exponential backoff reconnection)
+- [x] **1.8** Add connection health monitoring (`/grpc/jito/test`, `/grpc/jito/status`)
 
 ### Phase 2: Yellowstone gRPC Enhancements (Priority: Medium)
 

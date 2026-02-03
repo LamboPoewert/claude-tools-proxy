@@ -21,6 +21,21 @@ const RPC_URL = process.env.CONSTANTK_RPC_URL || null;
 const KALDERA_GRPC_URL = process.env.KALDERA_GRPC_URL || null;
 const KALDERA_X_TOKEN = process.env.KALDERA_X_TOKEN || null;
 
+// Jito gRPC Block Engine configuration
+// JITO_BLOCK_ENGINE_URL: gRPC endpoint (e.g., mainnet.block-engine.jito.wtf:443)
+// JITO_AUTH_KEYPAIR: Optional base58-encoded private key for authenticated access
+const JITO_BLOCK_ENGINE_URL = process.env.JITO_BLOCK_ENGINE_URL || 'mainnet.block-engine.jito.wtf:443';
+const JITO_AUTH_KEYPAIR = process.env.JITO_AUTH_KEYPAIR || null;
+
+// Jito gRPC regional endpoints for failover
+const JITO_GRPC_ENDPOINTS = [
+  'mainnet.block-engine.jito.wtf:443',
+  'frankfurt.mainnet.block-engine.jito.wtf:443',
+  'amsterdam.mainnet.block-engine.jito.wtf:443',
+  'ny.mainnet.block-engine.jito.wtf:443',
+  'tokyo.mainnet.block-engine.jito.wtf:443',
+];
+
 // Jito tip accounts (for bundles)
 const JITO_TIP_ACCOUNTS = [
   '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
@@ -363,6 +378,198 @@ app.post('/jupiter/swap', async (req, res) => {
   }
 });
 
+// ============================================================================
+// JITO gRPC ENDPOINTS - Phase 1 Implementation
+// ============================================================================
+
+// GET /grpc/jito/test - Test Jito gRPC connection health
+app.get('/grpc/jito/test', async (req, res) => {
+  try {
+    const status = jitoGrpc.getStatus();
+    const healthy = await jitoGrpc.isHealthy();
+    
+    res.json({
+      ok: healthy,
+      ...status,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Jito gRPC test error:', error.message);
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+      ...jitoGrpc.getStatus(),
+    });
+  }
+});
+
+// GET /grpc/jito/tip-accounts - Get Jito tip accounts via gRPC
+app.get('/grpc/jito/tip-accounts', async (req, res) => {
+  try {
+    const client = await jitoGrpc.getClient();
+    const result = await client.getTipAccounts();
+    
+    if (!result.ok) {
+      console.error('Jito getTipAccounts error:', result.error);
+      return res.status(500).json({
+        error: result.error?.message || 'Failed to get tip accounts',
+        code: result.error?.code,
+      });
+    }
+    
+    res.json({
+      accounts: result.value,
+      source: 'grpc',
+    });
+  } catch (error) {
+    console.error('Jito tip accounts error:', error.message);
+    // Try to reconnect on failure
+    jitoGrpc.reconnect().catch(() => {});
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /grpc/jito/leaders - Get connected leaders via gRPC
+app.get('/grpc/jito/leaders', async (req, res) => {
+  try {
+    const client = await jitoGrpc.getClient();
+    const result = await client.getConnectedLeaders();
+    
+    if (!result.ok) {
+      console.error('Jito getConnectedLeaders error:', result.error);
+      return res.status(500).json({
+        error: result.error?.message || 'Failed to get connected leaders',
+        code: result.error?.code,
+      });
+    }
+    
+    // Transform the response for easier consumption
+    const leaders = Object.entries(result.value).map(([identity, slotList]) => ({
+      identity,
+      slots: slotList.slots || [],
+    }));
+    
+    res.json({
+      leaders,
+      count: leaders.length,
+      source: 'grpc',
+    });
+  } catch (error) {
+    console.error('Jito leaders error:', error.message);
+    jitoGrpc.reconnect().catch(() => {});
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /grpc/jito/next-leader - Get next scheduled leader via gRPC
+app.get('/grpc/jito/next-leader', async (req, res) => {
+  try {
+    const client = await jitoGrpc.getClient();
+    const result = await client.getNextScheduledLeader();
+    
+    if (!result.ok) {
+      console.error('Jito getNextScheduledLeader error:', result.error);
+      return res.status(500).json({
+        error: result.error?.message || 'Failed to get next scheduled leader',
+        code: result.error?.code,
+      });
+    }
+    
+    res.json({
+      currentSlot: result.value.currentSlot,
+      nextLeaderSlot: result.value.nextLeaderSlot,
+      nextLeaderIdentity: result.value.nextLeaderIdentity,
+      slotsUntilLeader: result.value.nextLeaderSlot - result.value.currentSlot,
+      source: 'grpc',
+    });
+  } catch (error) {
+    console.error('Jito next leader error:', error.message);
+    jitoGrpc.reconnect().catch(() => {});
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /grpc/jito/bundle - Send bundle via Jito gRPC
+// Request body: { transactions: string[], tipLamports?: number }
+// transactions: Array of base64-encoded signed VersionedTransactions
+app.post('/grpc/jito/bundle', async (req, res) => {
+  try {
+    const { transactions, tipLamports } = req.body;
+    
+    if (!transactions || !Array.isArray(transactions)) {
+      return res.status(400).json({ error: 'transactions array required (base64-encoded VersionedTransactions)' });
+    }
+    
+    if (transactions.length === 0) {
+      return res.status(400).json({ error: 'At least one transaction required' });
+    }
+    
+    if (transactions.length > 5) {
+      return res.status(400).json({ error: 'Max 5 transactions per bundle' });
+    }
+    
+    console.log(`[gRPC] Sending Jito bundle with ${transactions.length} transactions...`);
+    
+    const client = await jitoGrpc.getClient();
+    
+    // Deserialize transactions from base64
+    const { VersionedTransaction } = require('@solana/web3.js');
+    const deserializedTxs = [];
+    
+    for (let i = 0; i < transactions.length; i++) {
+      try {
+        const txBuffer = Buffer.from(transactions[i], 'base64');
+        const tx = VersionedTransaction.deserialize(txBuffer);
+        deserializedTxs.push(tx);
+      } catch (err) {
+        return res.status(400).json({
+          error: `Failed to deserialize transaction ${i}: ${err.message}`,
+          index: i,
+        });
+      }
+    }
+    
+    // Create Bundle using jito-ts
+    const { Bundle } = require('jito-ts/dist/sdk/block-engine/types');
+    const bundle = new Bundle(deserializedTxs, 5);
+    
+    // Send bundle via gRPC
+    const startTime = Date.now();
+    const result = await client.sendBundle(bundle);
+    const latency = Date.now() - startTime;
+    
+    if (!result.ok) {
+      console.error('[gRPC] Jito bundle error:', result.error);
+      return res.status(500).json({
+        error: result.error?.message || 'Failed to send bundle',
+        code: result.error?.code,
+        details: result.error?.details,
+      });
+    }
+    
+    const uuid = result.value;
+    console.log(`[gRPC] Bundle accepted: ${uuid} (${latency}ms)`);
+    
+    res.json({
+      uuid,
+      status: 'accepted',
+      transactionCount: transactions.length,
+      latencyMs: latency,
+      source: 'grpc',
+    });
+  } catch (error) {
+    console.error('[gRPC] Jito bundle error:', error.message);
+    jitoGrpc.reconnect().catch(() => {});
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /grpc/jito/status - Get Jito gRPC connection status
+app.get('/grpc/jito/status', (req, res) => {
+  const status = jitoGrpc.getStatus();
+  res.json(status);
+});
+
 // --- Kaldera gRPC helpers ---
 function getKalderaEndpoint() {
   if (!KALDERA_GRPC_URL || !KALDERA_X_TOKEN) return null;
@@ -383,6 +590,140 @@ function getKalderaEndpoint() {
   }
   return { endpoint, token: KALDERA_X_TOKEN };
 }
+
+// --- Jito gRPC Client Manager ---
+// Manages Jito Block Engine gRPC connections with automatic reconnection
+class JitoGrpcManager {
+  constructor() {
+    this.client = null;
+    this.isConnecting = false;
+    this.connectionPromise = null;
+    this.lastError = null;
+    this.bundleResultSubscribers = new Map(); // ws -> cancelFn
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 5;
+    this.reconnectDelay = 1000;
+  }
+
+  // Parse auth keypair from base58 if provided
+  getAuthKeypair() {
+    if (!JITO_AUTH_KEYPAIR) return null;
+    try {
+      const { Keypair } = require('@solana/web3.js');
+      const bs58 = require('bs58');
+      const secretKey = bs58.decode(JITO_AUTH_KEYPAIR);
+      return Keypair.fromSecretKey(secretKey);
+    } catch (err) {
+      console.error('Failed to parse JITO_AUTH_KEYPAIR:', err.message);
+      return null;
+    }
+  }
+
+  // Get or create gRPC client connection
+  async getClient() {
+    if (this.client) return this.client;
+    if (this.isConnecting && this.connectionPromise) {
+      return this.connectionPromise;
+    }
+
+    this.isConnecting = true;
+    this.connectionPromise = this._connect();
+    
+    try {
+      const client = await this.connectionPromise;
+      this.isConnecting = false;
+      this.reconnectAttempts = 0;
+      return client;
+    } catch (err) {
+      this.isConnecting = false;
+      this.lastError = err;
+      throw err;
+    }
+  }
+
+  async _connect() {
+    const { searcherClient } = require('jito-ts/dist/sdk/block-engine/searcher');
+    const authKeypair = this.getAuthKeypair();
+    
+    const endpoint = JITO_BLOCK_ENGINE_URL;
+    console.log(`Connecting to Jito gRPC: ${endpoint}${authKeypair ? ' (authenticated)' : ' (public)'}`);
+    
+    try {
+      this.client = searcherClient(endpoint, authKeypair);
+      
+      // Test connection by getting tip accounts
+      const result = await this.client.getTipAccounts();
+      if (result.ok) {
+        console.log('Jito gRPC connected successfully');
+        return this.client;
+      } else {
+        throw new Error(result.error?.message || 'Failed to connect to Jito gRPC');
+      }
+    } catch (err) {
+      this.client = null;
+      console.error('Jito gRPC connection error:', err.message);
+      throw err;
+    }
+  }
+
+  // Attempt reconnection with exponential backoff
+  async reconnect() {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.error('Max reconnect attempts reached for Jito gRPC');
+      return null;
+    }
+    
+    this.client = null;
+    this.reconnectAttempts++;
+    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+    
+    console.log(`Reconnecting to Jito gRPC in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+    
+    try {
+      return await this.getClient();
+    } catch (err) {
+      return this.reconnect();
+    }
+  }
+
+  // Check connection health
+  async isHealthy() {
+    try {
+      const client = await this.getClient();
+      const result = await client.getTipAccounts();
+      return result.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  // Get status info
+  getStatus() {
+    return {
+      connected: !!this.client,
+      endpoint: JITO_BLOCK_ENGINE_URL,
+      authenticated: !!JITO_AUTH_KEYPAIR,
+      reconnectAttempts: this.reconnectAttempts,
+      lastError: this.lastError?.message || null,
+      activeSubscribers: this.bundleResultSubscribers.size,
+    };
+  }
+
+  // Clean up resources
+  cleanup() {
+    for (const [ws, cancelFn] of this.bundleResultSubscribers) {
+      try {
+        cancelFn();
+      } catch {}
+    }
+    this.bundleResultSubscribers.clear();
+    this.client = null;
+  }
+}
+
+// Singleton instance
+const jitoGrpc = new JitoGrpcManager();
 
 // Kaldera gRPC test — connect with x-token, call getSlot (unary) to verify connectivity
 app.get('/kaldera/test', async (req, res) => {
@@ -411,18 +752,125 @@ app.get('/kaldera/test', async (req, res) => {
   }
 });
 
-// --- HTTP server + WebSocket for slot stream ---
-// Don't pass WebSocket upgrade requests to Express (otherwise Express returns 404 for GET /kaldera/slots)
+// --- HTTP server + WebSocket for streams ---
+// WebSocket paths we handle:
+// - /kaldera/slots: Yellowstone slot stream
+// - /grpc/jito/bundle-results: Jito bundle result stream
+const WS_PATHS = ['/kaldera/slots', '/grpc/jito/bundle-results'];
+
 const server = http.createServer((req, res) => {
-  if (req.url && req.url.split('?')[0] === '/kaldera/slots' && (req.headers.upgrade || '').toLowerCase() === 'websocket') {
+  const path = req.url ? req.url.split('?')[0] : '';
+  const isUpgrade = (req.headers.upgrade || '').toLowerCase() === 'websocket';
+  
+  if (isUpgrade && WS_PATHS.includes(path)) {
     return; // leave connection open so server emits 'upgrade' and wss handles it
   }
   app(req, res);
 });
 
-// Kaldera slot stream: WebSocket at path /kaldera/slots — streams { slot, status, parent } for each new slot (Phase 2)
-const wss = new WebSocketServer({ server, path: '/kaldera/slots' });
-wss.on('connection', async (ws) => {
+// Kaldera slot stream: WebSocket at path /kaldera/slots — streams { slot, status, parent } for each new slot
+const wssSlots = new WebSocketServer({ server, path: '/kaldera/slots' });
+
+// Jito bundle results stream: WebSocket at path /grpc/jito/bundle-results
+const wssBundleResults = new WebSocketServer({ server, path: '/grpc/jito/bundle-results' });
+
+// --- Jito Bundle Results WebSocket Handler ---
+wssBundleResults.on('connection', async (ws) => {
+  console.log('[WS] New bundle results subscriber connected');
+  
+  let cancelSubscription = null;
+  
+  try {
+    const client = await jitoGrpc.getClient();
+    
+    // Subscribe to bundle results
+    cancelSubscription = client.onBundleResult(
+      (bundleResult) => {
+        if (ws.readyState === 1) { // WebSocket.OPEN
+          // Determine the status from the result
+          let status = 'unknown';
+          let details = null;
+          
+          if (bundleResult.rejected) {
+            status = 'rejected';
+            details = bundleResult.rejected;
+          } else if (bundleResult.finalized) {
+            status = 'finalized';
+            details = bundleResult.finalized;
+          } else if (bundleResult.processed) {
+            status = 'processed';
+            details = bundleResult.processed;
+          } else if (bundleResult.dropped) {
+            status = 'dropped';
+            details = bundleResult.dropped;
+          }
+          
+          ws.send(JSON.stringify({
+            bundleId: bundleResult.bundleId,
+            status,
+            slot: details?.slot ? String(details.slot) : undefined,
+            timestamp: new Date().toISOString(),
+            details,
+          }));
+        }
+      },
+      (error) => {
+        console.error('[WS] Bundle result stream error:', error.message);
+        if (ws.readyState === 1) {
+          ws.send(JSON.stringify({
+            error: error.message,
+            type: 'stream_error',
+          }));
+        }
+      }
+    );
+    
+    // Store the cancel function for cleanup
+    jitoGrpc.bundleResultSubscribers.set(ws, cancelSubscription);
+    
+    // Send confirmation message
+    ws.send(JSON.stringify({
+      type: 'subscribed',
+      message: 'Connected to Jito bundle results stream',
+      timestamp: new Date().toISOString(),
+    }));
+    
+  } catch (err) {
+    console.error('[WS] Failed to setup bundle results stream:', err.message);
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify({
+        error: err.message,
+        type: 'connection_error',
+      }));
+      ws.close();
+    }
+    return;
+  }
+  
+  // Handle client disconnect
+  ws.on('close', () => {
+    console.log('[WS] Bundle results subscriber disconnected');
+    if (cancelSubscription) {
+      try {
+        cancelSubscription();
+      } catch {}
+    }
+    jitoGrpc.bundleResultSubscribers.delete(ws);
+  });
+  
+  // Handle ping/pong for keepalive
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong', timestamp: new Date().toISOString() }));
+      }
+    } catch {}
+  });
+});
+
+// --- Kaldera Slot Stream WebSocket Handler ---
+wssSlots.on('connection', async (ws) => {
   const cfg = getKalderaEndpoint();
   if (!cfg) {
     ws.send(JSON.stringify({ error: 'Kaldera gRPC not configured' }));
@@ -486,5 +934,8 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Claude Tools Proxy running on port ${PORT}`);
   console.log(`   RPC: ${RPC_URL ? 'Constant K ✓' : 'NOT SET ✗ (set CONSTANTK_RPC_URL in env)'}`);
   console.log(`   Kaldera gRPC: ${KALDERA_GRPC_URL && KALDERA_X_TOKEN ? '✓' : 'NOT SET (optional: KALDERA_GRPC_URL, KALDERA_X_TOKEN)'}`);
-  console.log(`   Slot stream: wss://<host>/kaldera/slots`);
+  console.log(`   Jito gRPC: ${JITO_BLOCK_ENGINE_URL}${JITO_AUTH_KEYPAIR ? ' (authenticated)' : ' (public)'}`);
+  console.log(`   WebSocket streams:`);
+  console.log(`     - wss://<host>/kaldera/slots (Yellowstone slot stream)`);
+  console.log(`     - wss://<host>/grpc/jito/bundle-results (Jito bundle results)`);
 });

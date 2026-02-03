@@ -1,15 +1,16 @@
-# Claude Tools Bundler - Desktop App
+# Claude Tools Proxy
 
-Windows/Mac/Linux desktop application for launching pump.fun tokens with bundled buys.
+Solana RPC proxy with gRPC support for Jito bundles, Yellowstone streaming, and Jupiter swaps.
 
 ## Features
 
-- 🖥️ Full GUI interface (no terminal needed)
-- 🔑 Wallet generation and management
-- 💸 Fund wallets from master
-- 🚀 Bundle launch with Jito
-- 💰 Auto-sell options
-- 📊 Real-time status updates
+- RPC proxy to Constant K
+- Jito bundle sending (HTTP + gRPC)
+- Yellowstone gRPC slot streaming
+- Jito gRPC bundle results streaming
+- Jupiter quote and swap proxy
+- Token metadata hosting
+- Image hosting for NFTs
 
 ## Installation
 
@@ -23,70 +24,207 @@ Windows/Mac/Linux desktop application for launching pump.fun tokens with bundled
 # Install dependencies
 npm install
 
-# Run in development mode
+# Run server
 npm start
 ```
 
-### Build Windows .exe
+## Environment Variables
 
-```bash
-npm run build:win
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `PORT` | No | Server port (default: 3000) |
+| `CONSTANTK_RPC_URL` | Yes | Constant K RPC endpoint URL |
+| `KALDERA_GRPC_URL` | No | Yellowstone gRPC endpoint (e.g., `grpcs://...`) |
+| `KALDERA_X_TOKEN` | No | Yellowstone gRPC auth token |
+| `JITO_BLOCK_ENGINE_URL` | No | Jito gRPC endpoint (default: `mainnet.block-engine.jito.wtf:443`) |
+| `JITO_AUTH_KEYPAIR` | No | Base58-encoded private key for authenticated Jito access |
+
+## API Endpoints
+
+### Health Check
+
+```
+GET /
+```
+Returns service status.
+
+### RPC Proxy
+
+```
+POST /rpc
+```
+Proxies JSON-RPC requests to Constant K.
+
+### Jito HTTP Endpoints
+
+```
+POST /jito/bundle
+```
+Send bundle via HTTP (legacy).
+
+```
+POST /jito/status
+```
+Check bundle status.
+
+### Jito gRPC Endpoints (New)
+
+```
+GET /grpc/jito/test
+```
+Test Jito gRPC connection health.
+
+```
+GET /grpc/jito/status
+```
+Get Jito gRPC connection status.
+
+```
+GET /grpc/jito/tip-accounts
+```
+Get Jito tip accounts via gRPC.
+
+**Response:**
+```json
+{
+  "accounts": ["96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5", ...],
+  "source": "grpc"
+}
 ```
 
-This creates `Claude Tools Bundler.exe` in the `dist` folder.
+```
+GET /grpc/jito/leaders
+```
+Get connected leaders via gRPC.
 
-### Build for Mac
-
-```bash
-npm run build:mac
+**Response:**
+```json
+{
+  "leaders": [{"identity": "...", "slots": [123, 124]}],
+  "count": 10,
+  "source": "grpc"
+}
 ```
 
-### Build for Linux
+```
+GET /grpc/jito/next-leader
+```
+Get next scheduled leader.
 
-```bash
-npm run build:linux
+**Response:**
+```json
+{
+  "currentSlot": 123456,
+  "nextLeaderSlot": 123460,
+  "nextLeaderIdentity": "...",
+  "slotsUntilLeader": 4,
+  "source": "grpc"
+}
 ```
 
-## Usage
+```
+POST /grpc/jito/bundle
+```
+Send bundle via Jito gRPC (faster than HTTP).
 
-1. **Configure** - Enter your Helius API key and master wallet private key
-2. **Generate Wallets** - Create 10-20 bundle wallets
-3. **Fund Wallets** - Send SOL to each wallet
-4. **Bundle Launch** - Deploy token + bundled buys
-5. **Sell** - Exit positions
-6. **Collect** - Return SOL to master
+**Request:**
+```json
+{
+  "transactions": ["base64-encoded-versioned-tx-1", "base64-encoded-versioned-tx-2"]
+}
+```
 
-## Fee Structure
+**Response:**
+```json
+{
+  "uuid": "bundle-uuid",
+  "status": "accepted",
+  "transactionCount": 2,
+  "latencyMs": 85,
+  "source": "grpc"
+}
+```
 
-- **1% fee** on every bundle transaction
-- Fee sent to: `2sLRH2hXzg4XKp7SdX3aLMfWh1ZdiBqiAdh2PePX5L9T`
+### Jupiter Endpoints
 
-## Requirements
+```
+GET /jupiter/quote?inputMint=...&outputMint=...&amount=...
+```
+Get Jupiter swap quote.
 
-- **Helius API Key** - Get from [helius.dev](https://helius.dev)
-- **Master Wallet** - Solana wallet with SOL for operations
-- **Token Metadata** - Upload to IPFS before launching
+```
+POST /jupiter/swap
+```
+Get Jupiter swap transaction.
 
-## Security
+### Metadata Endpoints
 
-- Private keys are stored locally only
-- Never shared over network
-- Wallets saved in app data folder
+```
+POST /metadata
+```
+Create token metadata (returns URI).
 
-## Troubleshooting
+```
+GET /metadata/:id
+```
+Get token metadata JSON.
 
-**App won't start:**
-- Make sure Node.js 18+ is installed
-- Run `npm install` again
+```
+POST /metadata/image
+```
+Upload image (returns URL).
 
-**Build fails:**
-- Windows: May need Visual Studio Build Tools
-- Mac: May need Xcode Command Line Tools
+```
+GET /metadata/image/:id
+```
+Get uploaded image.
 
-**Transactions fail:**
-- Check Helius API key is valid
-- Ensure master wallet has enough SOL
-- Try increasing Jito tip
+### Yellowstone gRPC Endpoints
+
+```
+GET /kaldera/test
+```
+Test Kaldera/Yellowstone gRPC connection.
+
+## WebSocket Streams
+
+### Slot Stream
+```
+wss://<host>/kaldera/slots
+```
+Streams slot updates from Yellowstone gRPC.
+
+**Messages:**
+```json
+{"slot": "123456789", "status": 1, "parent": "123456788"}
+```
+
+### Bundle Results Stream (New)
+```
+wss://<host>/grpc/jito/bundle-results
+```
+Streams Jito bundle results in real-time.
+
+**Messages:**
+```json
+{
+  "bundleId": "uuid",
+  "status": "finalized",
+  "slot": "123456789",
+  "timestamp": "2024-01-01T00:00:00.000Z",
+  "details": {...}
+}
+```
+
+Status values: `finalized`, `processed`, `rejected`, `dropped`
+
+## Performance: gRPC vs HTTP
+
+| Metric | HTTP | gRPC |
+|--------|------|------|
+| Bundle send latency | 200-500ms | 50-150ms |
+| Connection overhead | Per-request | Persistent |
+| Confirmation notification | Polling | Stream (<100ms) |
 
 ## License
 
