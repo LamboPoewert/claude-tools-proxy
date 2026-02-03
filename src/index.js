@@ -413,76 +413,15 @@ app.get('/kaldera/test', async (req, res) => {
   }
 });
 
-// --- HTTP server + WebSocket for slot stream + positions ---
+// --- HTTP server + WebSocket for positions ---
 // Don't pass WebSocket upgrade requests to Express
-const WS_PATHS = ['/kaldera/slots', '/ws/positions'];
+const WS_PATHS = ['/ws/positions'];
 const server = http.createServer((req, res) => {
   const path = req.url && req.url.split('?')[0];
   if (WS_PATHS.includes(path) && (req.headers.upgrade || '').toLowerCase() === 'websocket') {
     return; // leave connection open so server emits 'upgrade' and wss handles it
   }
   app(req, res);
-});
-
-// Kaldera slot stream: WebSocket at path /kaldera/slots — streams { slot, status, parent } for each new slot (Phase 2)
-const wss = new WebSocketServer({ server, path: '/kaldera/slots' });
-wss.on('connection', async (ws) => {
-  const cfg = getKalderaEndpoint();
-  if (!cfg) {
-    ws.send(JSON.stringify({ error: 'Kaldera gRPC not configured' }));
-    ws.close();
-    return;
-  }
-  let stream = null;
-  let client = null;
-  try {
-    const { default: Client, CommitmentLevel } = await import('@triton-one/yellowstone-grpc');
-    client = new Client(cfg.endpoint, cfg.token, {
-      'grpc.max_receive_message_length': 64 * 1024 * 1024,
-    });
-    await client.connect();
-    stream = await client.subscribe();
-    // Subscribe to slots only (confirmed commitment)
-    const subscribeRequest = {
-      accounts: {},
-      slots: { slots: { filterByCommitment: true } },
-      transactions: {},
-      transactionsStatus: {},
-      blocks: {},
-      blocksMeta: {},
-      entry: {},
-      commitment: CommitmentLevel.CONFIRMED,
-      accountsDataSlice: [],
-      ping: { id: 1 },
-    };
-    stream.write(subscribeRequest);
-    stream.on('data', (update) => {
-      if (update.slot && ws.readyState === 1) {
-        ws.send(JSON.stringify({
-          slot: String(update.slot.slot),
-          status: update.slot.status,
-          parent: update.slot.parent ? String(update.slot.parent) : undefined,
-        }));
-      }
-    });
-    stream.on('error', (err) => {
-      console.error('Kaldera slot stream error:', err.message);
-      if (ws.readyState === 1) ws.send(JSON.stringify({ error: err.message }));
-    });
-    stream.on('end', () => {
-      if (ws.readyState === 1) ws.close();
-    });
-  } catch (err) {
-    console.error('Kaldera slot stream setup error:', err.message);
-    if (ws.readyState === 1) {
-      ws.send(JSON.stringify({ error: err.message }));
-      ws.close();
-    }
-    return;
-  }
-  ws.on('close', () => {
-    if (stream && typeof stream.destroy === 'function') stream.destroy();
-  });
 });
 
 // --- SOL/USD price cache (for real-time USD market cap) ---
@@ -773,6 +712,5 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Claude Tools Proxy running on port ${PORT}`);
   console.log(`   RPC: ${RPC_URL ? 'Constant K ✓' : 'NOT SET ✗ (set CONSTANTK_RPC_URL in env)'}`);
   console.log(`   Kaldera gRPC: ${KALDERA_GRPC_URL && KALDERA_X_TOKEN ? '✓' : 'NOT SET (optional: KALDERA_GRPC_URL, KALDERA_X_TOKEN)'}`);
-  console.log(`   Slot stream: wss://<host>/kaldera/slots`);
-  console.log(`   Positions:   wss://<host>/ws/positions`);
+  console.log(`   Positions: wss://<host>/ws/positions`);
 });
