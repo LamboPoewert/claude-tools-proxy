@@ -12,6 +12,11 @@ Solana RPC proxy with gRPC support for Jito bundles, Yellowstone streaming, and 
   - Account change subscriptions
   - Fast blockhash retrieval
 - Jito gRPC bundle results streaming
+- **Unified Buy/Sell Endpoints**:
+  - gRPC-optimized trade execution
+  - Jupiter integration for best prices
+  - Jito MEV protection
+  - Real-time trade status streaming
 - Jupiter quote and swap proxy
 - Token metadata hosting
 - Image hosting for NFTs
@@ -238,6 +243,108 @@ Check if blockhash is valid via gRPC.
 }
 ```
 
+### Unified Trade Endpoints (Phase 3)
+
+```
+POST /grpc/buy
+```
+Execute a buy trade (SOL -> Token) using gRPC for fast blockhash + Jito bundle.
+
+**Request:**
+```json
+{
+  "outputMint": "token-mint-address",
+  "amountLamports": 1000000000,
+  "slippageBps": 100,
+  "walletPubkey": "your-wallet-pubkey",
+  "signedTransaction": "base64-signed-tx (optional)",
+  "tipLamports": 10000
+}
+```
+
+**Response (if signedTransaction provided):**
+```json
+{
+  "success": true,
+  "tradeId": "unique-trade-id",
+  "bundleId": "jito-bundle-uuid",
+  "quote": {
+    "inAmount": "1000000000",
+    "outAmount": "123456789",
+    "priceImpactPct": "0.5"
+  }
+}
+```
+
+**Response (if no signedTransaction - returns unsigned tx for client to sign):**
+```json
+{
+  "success": true,
+  "tradeId": "unique-trade-id",
+  "status": "awaiting_signature",
+  "swapTransaction": "base64-unsigned-tx",
+  "blockhash": "...",
+  "lastValidBlockHeight": "123456789",
+  "quote": {...},
+  "tipAccount": "jito-tip-account",
+  "tipLamports": 10000
+}
+```
+
+```
+POST /grpc/sell
+```
+Execute a sell trade (Token -> SOL) using gRPC for fast blockhash + Jito bundle.
+
+**Request:**
+```json
+{
+  "inputMint": "token-mint-address",
+  "amountTokens": "1000000",
+  "slippageBps": 100,
+  "walletPubkey": "your-wallet-pubkey",
+  "signedTransaction": "base64-signed-tx (optional)",
+  "tipLamports": 10000
+}
+```
+
+```
+POST /grpc/trade/submit
+```
+Submit a signed transaction for a pending trade.
+
+**Request:**
+```json
+{
+  "tradeId": "unique-trade-id",
+  "signedTransaction": "base64-signed-tx"
+}
+```
+
+```
+GET /grpc/trade/:tradeId
+```
+Get trade status and history.
+
+**Response:**
+```json
+{
+  "id": "trade-id",
+  "type": "buy",
+  "status": "submitted",
+  "inputMint": "...",
+  "outputMint": "...",
+  "bundleId": "jito-uuid",
+  "steps": [
+    {"name": "blockhash", "status": "success", "data": {...}},
+    {"name": "quote", "status": "success", "data": {...}},
+    {"name": "bundle_sent", "status": "success", "data": {...}}
+  ],
+  "createdAt": "...",
+  "updatedAt": "..."
+}
+```
+
 ## WebSocket Streams
 
 ### Slot Stream
@@ -333,6 +440,38 @@ Subscribe to account changes by address or owner.
   "timestamp": "2024-01-01T00:00:00.000Z"
 }
 ```
+
+### Trade Status Stream
+```
+wss://<host>/grpc/trade/status
+```
+Subscribe to real-time trade status updates.
+
+**Subscribe Message:**
+```json
+{
+  "action": "subscribe",
+  "tradeId": "your-trade-id"
+}
+```
+
+**Trade Update Messages:**
+```json
+{
+  "type": "trade_update",
+  "tradeId": "...",
+  "trade": {
+    "id": "...",
+    "type": "buy",
+    "status": "submitted",
+    "step": "sending_bundle",
+    "bundleId": "jito-uuid",
+    "updatedAt": "..."
+  }
+}
+```
+
+Trade status values: `pending`, `started`, `awaiting_signature`, `submitted`, `failed`
 
 ## Performance: gRPC vs HTTP
 

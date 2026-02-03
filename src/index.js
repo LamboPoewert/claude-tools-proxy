@@ -692,6 +692,138 @@ app.post('/grpc/blockhash/valid', async (req, res) => {
   }
 });
 
+// ============================================================================
+// PHASE 3: UNIFIED BUY/SELL gRPC ENDPOINTS
+// ============================================================================
+
+// POST /grpc/buy - Execute a buy trade (SOL -> Token)
+// Uses gRPC for fast blockhash + Jito bundle submission
+app.post('/grpc/buy', async (req, res) => {
+  try {
+    const {
+      outputMint,
+      amountLamports,
+      slippageBps,
+      walletPubkey,
+      signedTransaction,
+      tipLamports,
+    } = req.body;
+
+    if (!outputMint) {
+      return res.status(400).json({ error: 'outputMint required (token to buy)' });
+    }
+    if (!amountLamports) {
+      return res.status(400).json({ error: 'amountLamports required (SOL amount in lamports)' });
+    }
+    if (!walletPubkey) {
+      return res.status(400).json({ error: 'walletPubkey required' });
+    }
+
+    console.log(`[Trade] Buy request: ${amountLamports} lamports -> ${outputMint}`);
+
+    const result = await tradeService.executeBuy({
+      outputMint,
+      amountLamports: parseInt(amountLamports),
+      slippageBps: slippageBps ? parseInt(slippageBps) : 100,
+      walletPubkey,
+      signedTransaction,
+      tipLamports: tipLamports ? parseInt(tipLamports) : 10000,
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error('[Trade] Buy error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /grpc/sell - Execute a sell trade (Token -> SOL)
+// Uses gRPC for fast blockhash + Jito bundle submission
+app.post('/grpc/sell', async (req, res) => {
+  try {
+    const {
+      inputMint,
+      amountTokens,
+      slippageBps,
+      walletPubkey,
+      signedTransaction,
+      tipLamports,
+    } = req.body;
+
+    if (!inputMint) {
+      return res.status(400).json({ error: 'inputMint required (token to sell)' });
+    }
+    if (!amountTokens) {
+      return res.status(400).json({ error: 'amountTokens required (token amount in smallest units)' });
+    }
+    if (!walletPubkey) {
+      return res.status(400).json({ error: 'walletPubkey required' });
+    }
+
+    console.log(`[Trade] Sell request: ${amountTokens} ${inputMint} -> SOL`);
+
+    const result = await tradeService.executeSell({
+      inputMint,
+      amountTokens: amountTokens.toString(),
+      slippageBps: slippageBps ? parseInt(slippageBps) : 100,
+      walletPubkey,
+      signedTransaction,
+      tipLamports: tipLamports ? parseInt(tipLamports) : 10000,
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error('[Trade] Sell error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /grpc/trade/submit - Submit a signed transaction for a pending trade
+app.post('/grpc/trade/submit', async (req, res) => {
+  try {
+    const { tradeId, signedTransaction } = req.body;
+
+    if (!tradeId) {
+      return res.status(400).json({ error: 'tradeId required' });
+    }
+    if (!signedTransaction) {
+      return res.status(400).json({ error: 'signedTransaction required (base64 encoded)' });
+    }
+
+    console.log(`[Trade] Submitting signed transaction for trade: ${tradeId}`);
+
+    const result = await tradeService.submitSignedTransaction(tradeId, signedTransaction);
+    res.json(result);
+  } catch (error) {
+    console.error('[Trade] Submit error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /grpc/trade/:tradeId - Get trade status and history
+app.get('/grpc/trade/:tradeId', (req, res) => {
+  const trade = tradeService.getTrade(req.params.tradeId);
+  
+  if (!trade) {
+    return res.status(404).json({ error: 'Trade not found' });
+  }
+
+  res.json({
+    id: trade.id,
+    type: trade.type,
+    status: trade.status,
+    inputMint: trade.inputMint,
+    outputMint: trade.outputMint,
+    amount: trade.amount,
+    walletPubkey: trade.walletPubkey,
+    bundleId: trade.bundleId,
+    error: trade.error,
+    steps: trade.steps,
+    createdAt: trade.createdAt,
+    updatedAt: trade.updatedAt,
+  });
+});
+
 // --- Kaldera gRPC helpers ---
 function getKalderaEndpoint() {
   if (!KALDERA_GRPC_URL || !KALDERA_X_TOKEN) return null;
@@ -1028,6 +1160,475 @@ class YellowstoneGrpcManager {
 // Singleton instance
 const yellowstoneGrpc = new YellowstoneGrpcManager();
 
+// --- Trade Service ---
+// Unified service for buy/sell operations using gRPC
+class TradeService {
+  constructor() {
+    this.activeTrades = new Map(); // tradeId -> trade info
+    this.tradeSubscribers = new Map(); // ws -> Set of tradeIds
+  }
+
+  // Generate unique trade ID
+  generateTradeId() {
+    return crypto.randomBytes(16).toString('hex');
+  }
+
+  // Get random tip account
+  getRandomTipAccount() {
+    return JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)];
+  }
+
+  // Get Jupiter quote
+  async getJupiterQuote(inputMint, outputMint, amount, slippageBps = 100) {
+    const params = new URLSearchParams({
+      inputMint,
+      outputMint,
+      amount: amount.toString(),
+      slippageBps: slippageBps.toString(),
+    });
+    
+    const response = await fetch(`https://quote-api.jup.ag/v6/quote?${params}`, {
+      headers: { 'Accept': 'application/json' },
+    });
+    
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Jupiter quote failed: ${text}`);
+    }
+    
+    return await response.json();
+  }
+
+  // Get Jupiter swap transaction
+  async getJupiterSwapTx(quoteResponse, userPublicKey, options = {}) {
+    const response = await fetch('https://quote-api.jup.ag/v6/swap', {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({
+        quoteResponse,
+        userPublicKey,
+        wrapAndUnwrapSol: options.wrapAndUnwrapSol ?? true,
+        dynamicComputeUnitLimit: options.dynamicComputeUnitLimit ?? true,
+        prioritizationFeeLamports: options.prioritizationFeeLamports || 'auto',
+      }),
+    });
+    
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Jupiter swap failed: ${text}`);
+    }
+    
+    return await response.json();
+  }
+
+  // Execute a buy trade (SOL -> Token)
+  async executeBuy(params) {
+    const {
+      outputMint,
+      amountLamports,
+      slippageBps = 100,
+      walletPubkey,
+      signedTransaction, // Base64 encoded signed transaction (if pre-signed)
+      tipLamports = 10000,
+    } = params;
+
+    const tradeId = this.generateTradeId();
+    const SOL_MINT = 'So11111111111111111111111111111111111111112';
+    
+    const trade = {
+      id: tradeId,
+      type: 'buy',
+      status: 'pending',
+      inputMint: SOL_MINT,
+      outputMint,
+      amount: amountLamports,
+      walletPubkey,
+      createdAt: new Date().toISOString(),
+      steps: [],
+    };
+    
+    this.activeTrades.set(tradeId, trade);
+    this._updateTrade(tradeId, { status: 'started' });
+
+    try {
+      // Step 1: Get blockhash via gRPC (fast)
+      this._updateTrade(tradeId, { step: 'getting_blockhash' });
+      let blockhash, lastValidBlockHeight;
+      
+      try {
+        const bhResult = await yellowstoneGrpc.getLatestBlockhash(1);
+        blockhash = bhResult.blockhash;
+        lastValidBlockHeight = bhResult.lastValidBlockHeight;
+        this._addStep(tradeId, 'blockhash', 'success', { blockhash, source: 'grpc' });
+      } catch (err) {
+        // Fallback to RPC
+        console.log('gRPC blockhash failed, falling back to RPC');
+        const rpcResult = await this._getRpcBlockhash();
+        blockhash = rpcResult.blockhash;
+        lastValidBlockHeight = rpcResult.lastValidBlockHeight;
+        this._addStep(tradeId, 'blockhash', 'success', { blockhash, source: 'rpc_fallback' });
+      }
+
+      // Step 2: Get Jupiter quote
+      this._updateTrade(tradeId, { step: 'getting_quote' });
+      const quote = await this.getJupiterQuote(SOL_MINT, outputMint, amountLamports, slippageBps);
+      this._addStep(tradeId, 'quote', 'success', {
+        inAmount: quote.inAmount,
+        outAmount: quote.outAmount,
+        priceImpactPct: quote.priceImpactPct,
+      });
+
+      // Step 3: Get swap transaction from Jupiter
+      this._updateTrade(tradeId, { step: 'building_transaction' });
+      const swapResult = await this.getJupiterSwapTx(quote, walletPubkey);
+      this._addStep(tradeId, 'swap_tx', 'success', { hasTransaction: !!swapResult.swapTransaction });
+
+      // If signedTransaction provided, use it; otherwise return unsigned for client to sign
+      if (signedTransaction) {
+        // Step 4: Send via Jito gRPC
+        this._updateTrade(tradeId, { step: 'sending_bundle' });
+        
+        const bundleResult = await this._sendViaJitoGrpc([signedTransaction]);
+        
+        if (bundleResult.ok) {
+          this._addStep(tradeId, 'bundle_sent', 'success', { uuid: bundleResult.uuid });
+          this._updateTrade(tradeId, {
+            status: 'submitted',
+            bundleId: bundleResult.uuid,
+          });
+          
+          return {
+            success: true,
+            tradeId,
+            bundleId: bundleResult.uuid,
+            quote: {
+              inAmount: quote.inAmount,
+              outAmount: quote.outAmount,
+              priceImpactPct: quote.priceImpactPct,
+            },
+          };
+        } else {
+          throw new Error(bundleResult.error || 'Bundle submission failed');
+        }
+      } else {
+        // Return unsigned transaction for client to sign
+        this._updateTrade(tradeId, { status: 'awaiting_signature' });
+        
+        return {
+          success: true,
+          tradeId,
+          status: 'awaiting_signature',
+          swapTransaction: swapResult.swapTransaction,
+          blockhash,
+          lastValidBlockHeight: String(lastValidBlockHeight),
+          quote: {
+            inAmount: quote.inAmount,
+            outAmount: quote.outAmount,
+            priceImpactPct: quote.priceImpactPct,
+          },
+          tipAccount: this.getRandomTipAccount(),
+          tipLamports,
+        };
+      }
+    } catch (error) {
+      this._updateTrade(tradeId, { status: 'failed', error: error.message });
+      this._addStep(tradeId, 'error', 'failed', { message: error.message });
+      throw error;
+    }
+  }
+
+  // Execute a sell trade (Token -> SOL)
+  async executeSell(params) {
+    const {
+      inputMint,
+      amountTokens,
+      slippageBps = 100,
+      walletPubkey,
+      signedTransaction,
+      tipLamports = 10000,
+    } = params;
+
+    const tradeId = this.generateTradeId();
+    const SOL_MINT = 'So11111111111111111111111111111111111111112';
+    
+    const trade = {
+      id: tradeId,
+      type: 'sell',
+      status: 'pending',
+      inputMint,
+      outputMint: SOL_MINT,
+      amount: amountTokens,
+      walletPubkey,
+      createdAt: new Date().toISOString(),
+      steps: [],
+    };
+    
+    this.activeTrades.set(tradeId, trade);
+    this._updateTrade(tradeId, { status: 'started' });
+
+    try {
+      // Step 1: Get blockhash via gRPC (fast)
+      this._updateTrade(tradeId, { step: 'getting_blockhash' });
+      let blockhash, lastValidBlockHeight;
+      
+      try {
+        const bhResult = await yellowstoneGrpc.getLatestBlockhash(1);
+        blockhash = bhResult.blockhash;
+        lastValidBlockHeight = bhResult.lastValidBlockHeight;
+        this._addStep(tradeId, 'blockhash', 'success', { blockhash, source: 'grpc' });
+      } catch (err) {
+        const rpcResult = await this._getRpcBlockhash();
+        blockhash = rpcResult.blockhash;
+        lastValidBlockHeight = rpcResult.lastValidBlockHeight;
+        this._addStep(tradeId, 'blockhash', 'success', { blockhash, source: 'rpc_fallback' });
+      }
+
+      // Step 2: Get Jupiter quote
+      this._updateTrade(tradeId, { step: 'getting_quote' });
+      const quote = await this.getJupiterQuote(inputMint, SOL_MINT, amountTokens, slippageBps);
+      this._addStep(tradeId, 'quote', 'success', {
+        inAmount: quote.inAmount,
+        outAmount: quote.outAmount,
+        priceImpactPct: quote.priceImpactPct,
+      });
+
+      // Step 3: Get swap transaction from Jupiter
+      this._updateTrade(tradeId, { step: 'building_transaction' });
+      const swapResult = await this.getJupiterSwapTx(quote, walletPubkey);
+      this._addStep(tradeId, 'swap_tx', 'success', { hasTransaction: !!swapResult.swapTransaction });
+
+      if (signedTransaction) {
+        // Step 4: Send via Jito gRPC
+        this._updateTrade(tradeId, { step: 'sending_bundle' });
+        
+        const bundleResult = await this._sendViaJitoGrpc([signedTransaction]);
+        
+        if (bundleResult.ok) {
+          this._addStep(tradeId, 'bundle_sent', 'success', { uuid: bundleResult.uuid });
+          this._updateTrade(tradeId, {
+            status: 'submitted',
+            bundleId: bundleResult.uuid,
+          });
+          
+          return {
+            success: true,
+            tradeId,
+            bundleId: bundleResult.uuid,
+            quote: {
+              inAmount: quote.inAmount,
+              outAmount: quote.outAmount,
+              priceImpactPct: quote.priceImpactPct,
+            },
+          };
+        } else {
+          throw new Error(bundleResult.error || 'Bundle submission failed');
+        }
+      } else {
+        this._updateTrade(tradeId, { status: 'awaiting_signature' });
+        
+        return {
+          success: true,
+          tradeId,
+          status: 'awaiting_signature',
+          swapTransaction: swapResult.swapTransaction,
+          blockhash,
+          lastValidBlockHeight: String(lastValidBlockHeight),
+          quote: {
+            inAmount: quote.inAmount,
+            outAmount: quote.outAmount,
+            priceImpactPct: quote.priceImpactPct,
+          },
+          tipAccount: this.getRandomTipAccount(),
+          tipLamports,
+        };
+      }
+    } catch (error) {
+      this._updateTrade(tradeId, { status: 'failed', error: error.message });
+      this._addStep(tradeId, 'error', 'failed', { message: error.message });
+      throw error;
+    }
+  }
+
+  // Submit a signed transaction for a pending trade
+  async submitSignedTransaction(tradeId, signedTransaction) {
+    const trade = this.activeTrades.get(tradeId);
+    if (!trade) {
+      throw new Error('Trade not found');
+    }
+    
+    if (trade.status !== 'awaiting_signature') {
+      throw new Error(`Trade is not awaiting signature (status: ${trade.status})`);
+    }
+
+    this._updateTrade(tradeId, { step: 'sending_bundle' });
+    
+    try {
+      const bundleResult = await this._sendViaJitoGrpc([signedTransaction]);
+      
+      if (bundleResult.ok) {
+        this._addStep(tradeId, 'bundle_sent', 'success', { uuid: bundleResult.uuid });
+        this._updateTrade(tradeId, {
+          status: 'submitted',
+          bundleId: bundleResult.uuid,
+        });
+        
+        return {
+          success: true,
+          tradeId,
+          bundleId: bundleResult.uuid,
+        };
+      } else {
+        throw new Error(bundleResult.error || 'Bundle submission failed');
+      }
+    } catch (error) {
+      this._updateTrade(tradeId, { status: 'failed', error: error.message });
+      this._addStep(tradeId, 'error', 'failed', { message: error.message });
+      throw error;
+    }
+  }
+
+  // Send transactions via Jito gRPC
+  async _sendViaJitoGrpc(transactions) {
+    try {
+      const client = await jitoGrpc.getClient();
+      const { VersionedTransaction } = require('@solana/web3.js');
+      const { Bundle } = require('jito-ts/dist/sdk/block-engine/types');
+      
+      const deserializedTxs = transactions.map(tx => {
+        const buffer = Buffer.from(tx, 'base64');
+        return VersionedTransaction.deserialize(buffer);
+      });
+      
+      const bundle = new Bundle(deserializedTxs, 5);
+      const result = await client.sendBundle(bundle);
+      
+      if (result.ok) {
+        return { ok: true, uuid: result.value };
+      } else {
+        return { ok: false, error: result.error?.message || 'Unknown error' };
+      }
+    } catch (error) {
+      return { ok: false, error: error.message };
+    }
+  }
+
+  // Fallback RPC blockhash
+  async _getRpcBlockhash() {
+    if (!RPC_URL) {
+      throw new Error('RPC not configured');
+    }
+    
+    const response = await fetch(RPC_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getLatestBlockhash',
+        params: [{ commitment: 'confirmed' }],
+      }),
+    });
+    
+    const data = await response.json();
+    if (data.error) {
+      throw new Error(data.error.message);
+    }
+    
+    return {
+      blockhash: data.result.value.blockhash,
+      lastValidBlockHeight: data.result.value.lastValidBlockHeight,
+    };
+  }
+
+  // Update trade state
+  _updateTrade(tradeId, updates) {
+    const trade = this.activeTrades.get(tradeId);
+    if (trade) {
+      Object.assign(trade, updates, { updatedAt: new Date().toISOString() });
+      this._notifySubscribers(tradeId, trade);
+    }
+  }
+
+  // Add step to trade history
+  _addStep(tradeId, name, status, data = {}) {
+    const trade = this.activeTrades.get(tradeId);
+    if (trade) {
+      trade.steps.push({
+        name,
+        status,
+        data,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  // Notify WebSocket subscribers
+  _notifySubscribers(tradeId, trade) {
+    for (const [ws, tradeIds] of this.tradeSubscribers) {
+      if (tradeIds.has(tradeId) && ws.readyState === 1) {
+        ws.send(JSON.stringify({
+          type: 'trade_update',
+          tradeId,
+          trade: {
+            id: trade.id,
+            type: trade.type,
+            status: trade.status,
+            step: trade.step,
+            bundleId: trade.bundleId,
+            error: trade.error,
+            updatedAt: trade.updatedAt,
+          },
+        }));
+      }
+    }
+  }
+
+  // Get trade by ID
+  getTrade(tradeId) {
+    return this.activeTrades.get(tradeId);
+  }
+
+  // Subscribe to trade updates
+  subscribe(ws, tradeId) {
+    if (!this.tradeSubscribers.has(ws)) {
+      this.tradeSubscribers.set(ws, new Set());
+    }
+    this.tradeSubscribers.get(ws).add(tradeId);
+  }
+
+  // Unsubscribe from trade updates
+  unsubscribe(ws, tradeId) {
+    const tradeIds = this.tradeSubscribers.get(ws);
+    if (tradeIds) {
+      if (tradeId) {
+        tradeIds.delete(tradeId);
+      } else {
+        this.tradeSubscribers.delete(ws);
+      }
+    }
+  }
+
+  // Clean up old trades (call periodically)
+  cleanup(maxAgeMs = 3600000) { // Default: 1 hour
+    const now = Date.now();
+    for (const [tradeId, trade] of this.activeTrades) {
+      const createdAt = new Date(trade.createdAt).getTime();
+      if (now - createdAt > maxAgeMs) {
+        this.activeTrades.delete(tradeId);
+      }
+    }
+  }
+}
+
+// Singleton instance
+const tradeService = new TradeService();
+
+// Cleanup old trades every 10 minutes
+setInterval(() => tradeService.cleanup(), 600000);
+
 // Kaldera gRPC test — connect with x-token, call getSlot (unary) to verify connectivity
 app.get('/kaldera/test', async (req, res) => {
   const cfg = getKalderaEndpoint();
@@ -1064,6 +1665,7 @@ const WS_PATHS = [
   '/grpc/jito/bundle-results',
   '/grpc/subscribe/transactions',
   '/grpc/subscribe/accounts',
+  '/grpc/trade/status',
 ];
 
 const server = http.createServer((req, res) => {
@@ -1087,6 +1689,9 @@ const wssTransactions = new WebSocketServer({ server, path: '/grpc/subscribe/tra
 
 // Yellowstone account stream: WebSocket at path /grpc/subscribe/accounts
 const wssAccounts = new WebSocketServer({ server, path: '/grpc/subscribe/accounts' });
+
+// Trade status stream: WebSocket at path /grpc/trade/status
+const wssTradeStatus = new WebSocketServer({ server, path: '/grpc/trade/status' });
 
 // --- Jito Bundle Results WebSocket Handler ---
 wssBundleResults.on('connection', async (ws) => {
@@ -1180,6 +1785,81 @@ wssBundleResults.on('connection', async (ws) => {
         ws.send(JSON.stringify({ type: 'pong', timestamp: new Date().toISOString() }));
       }
     } catch {}
+  });
+});
+
+// --- Trade Status WebSocket Handler ---
+// Subscribe to trade status updates
+wssTradeStatus.on('connection', (ws) => {
+  console.log('[WS] New trade status subscriber connected');
+
+  // Send welcome message with instructions
+  ws.send(JSON.stringify({
+    type: 'connected',
+    message: 'Connected to trade status stream. Subscribe to trades to receive updates.',
+    example: {
+      action: 'subscribe',
+      tradeId: 'your-trade-id',
+    },
+  }));
+
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      
+      if (msg.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong', timestamp: new Date().toISOString() }));
+        return;
+      }
+      
+      if (msg.action === 'subscribe' && msg.tradeId) {
+        const trade = tradeService.getTrade(msg.tradeId);
+        
+        if (!trade) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: 'Trade not found',
+            tradeId: msg.tradeId,
+          }));
+          return;
+        }
+        
+        tradeService.subscribe(ws, msg.tradeId);
+        
+        // Send current state immediately
+        ws.send(JSON.stringify({
+          type: 'subscribed',
+          tradeId: msg.tradeId,
+          trade: {
+            id: trade.id,
+            type: trade.type,
+            status: trade.status,
+            step: trade.step,
+            bundleId: trade.bundleId,
+            error: trade.error,
+            steps: trade.steps,
+            createdAt: trade.createdAt,
+            updatedAt: trade.updatedAt,
+          },
+        }));
+      }
+      
+      if (msg.action === 'unsubscribe' && msg.tradeId) {
+        tradeService.unsubscribe(ws, msg.tradeId);
+        ws.send(JSON.stringify({
+          type: 'unsubscribed',
+          tradeId: msg.tradeId,
+        }));
+      }
+      
+    } catch (err) {
+      ws.send(JSON.stringify({ error: 'Invalid message format', type: 'parse_error' }));
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('[WS] Trade status subscriber disconnected');
+    tradeService.unsubscribe(ws);
   });
 });
 
@@ -1548,9 +2228,11 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`   RPC: ${RPC_URL ? 'Constant K ✓' : 'NOT SET ✗ (set CONSTANTK_RPC_URL in env)'}`);
   console.log(`   Yellowstone gRPC: ${KALDERA_GRPC_URL && KALDERA_X_TOKEN ? '✓' : 'NOT SET (optional: KALDERA_GRPC_URL, KALDERA_X_TOKEN)'}`);
   console.log(`   Jito gRPC: ${JITO_BLOCK_ENGINE_URL}${JITO_AUTH_KEYPAIR ? ' (authenticated)' : ' (public)'}`);
+  console.log(`   Trade endpoints: POST /grpc/buy, POST /grpc/sell`);
   console.log(`   WebSocket streams:`);
   console.log(`     - wss://<host>/kaldera/slots (slot updates)`);
   console.log(`     - wss://<host>/grpc/jito/bundle-results (Jito bundle results)`);
   console.log(`     - wss://<host>/grpc/subscribe/transactions (transaction stream)`);
   console.log(`     - wss://<host>/grpc/subscribe/accounts (account updates)`);
+  console.log(`     - wss://<host>/grpc/trade/status (trade status updates)`);
 });

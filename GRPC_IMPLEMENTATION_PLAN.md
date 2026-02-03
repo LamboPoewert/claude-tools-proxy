@@ -240,13 +240,14 @@ const subscribeRequest = {
 - [x] **2.4** Implement connection pooling for multiple subscribers (`YellowstoneGrpcManager` class)
 - [x] **2.5** Add subscription management (subscribe/unsubscribe via WebSocket messages)
 
-### Phase 3: Unified Trade Endpoints (Priority: Medium)
+### Phase 3: Unified Trade Endpoints (Priority: Medium) ✅ COMPLETED
 
-- [ ] **3.1** Implement `/grpc/buy` endpoint
-- [ ] **3.2** Implement `/grpc/sell` endpoint
-- [ ] **3.3** Implement trade status WebSocket
-- [ ] **3.4** Add transaction builder with Jito tip
-- [ ] **3.5** Integration testing
+- [x] **3.1** Implement `/grpc/buy` endpoint (SOL -> Token with Jupiter + Jito gRPC)
+- [x] **3.2** Implement `/grpc/sell` endpoint (Token -> SOL with Jupiter + Jito gRPC)
+- [x] **3.3** Implement trade status WebSocket (`/grpc/trade/status`)
+- [x] **3.4** Add TradeService with transaction builder and Jito tip support
+- [x] **3.5** Add `/grpc/trade/submit` for deferred transaction signing
+- [x] **3.6** Add `/grpc/trade/:tradeId` for trade status and history
 
 ### Phase 4: Documentation & Testing (Priority: Low)
 
