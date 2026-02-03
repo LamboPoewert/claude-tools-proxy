@@ -61,8 +61,77 @@ const JITO_RETRY_DELAY_MS = 800;
 
 // Security middleware
 app.use(helmet());
-app.use(cors());
+
+// CORS - Restrict to allowed origins
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS 
+  ? process.env.ALLOWED_ORIGINS.split(',') 
+  : ['http://localhost:3000', 'http://localhost:5173'];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (desktop apps, curl, etc.)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin) || ALLOWED_ORIGINS.includes('*')) {
+      return callback(null, true);
+    }
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+}));
+
 app.use(express.json({ limit: '10mb' }));
+
+// ============== API KEY AUTHENTICATION ==============
+// Set API_KEYS in environment: comma-separated list of valid keys
+// Example: API_KEYS=key1,key2,key3
+const API_KEYS = process.env.API_KEYS ? process.env.API_KEYS.split(',').map(k => k.trim()) : [];
+const REQUIRE_AUTH = process.env.REQUIRE_AUTH === 'true';
+
+// Middleware to validate API key
+function requireApiKey(req, res, next) {
+  // Skip auth if not required (for backwards compatibility)
+  if (!REQUIRE_AUTH || API_KEYS.length === 0) {
+    return next();
+  }
+  
+  const apiKey = req.headers['x-api-key'] || req.query.apiKey;
+  
+  if (!apiKey) {
+    return res.status(401).json({ 
+      error: 'API key required',
+      message: 'Include X-API-Key header or apiKey query parameter'
+    });
+  }
+  
+  if (!API_KEYS.includes(apiKey)) {
+    console.warn(`Invalid API key attempt: ${apiKey.slice(0, 8)}...`);
+    return res.status(403).json({ 
+      error: 'Invalid API key',
+      message: 'The provided API key is not valid'
+    });
+  }
+  
+  next();
+}
+
+// Middleware for sensitive endpoints (always require auth if keys are configured)
+function requireApiKeyStrict(req, res, next) {
+  if (API_KEYS.length === 0) {
+    return next(); // No keys configured, allow all
+  }
+  
+  const apiKey = req.headers['x-api-key'] || req.query.apiKey;
+  
+  if (!apiKey || !API_KEYS.includes(apiKey)) {
+    console.warn(`Unauthorized access attempt to ${req.path}`);
+    return res.status(403).json({ 
+      error: 'Authentication required',
+      message: 'This endpoint requires a valid API key'
+    });
+  }
+  
+  next();
+}
 
 // Health check — before rate limiter so connection test and Railway healthchecks never get 429
 app.get('/', (req, res) => {
@@ -189,7 +258,8 @@ const JITO_PARALLEL_SEND = 4;
 
 // Proxy bundle requests to Jito
 // Send bundle to multiple Jito endpoints in parallel so at least one is likely to land
-app.post('/jito/bundle', async (req, res) => {
+// Protected: Requires API key if configured
+app.post('/jito/bundle', requireApiKeyStrict, async (req, res) => {
   try {
     const { transactions, encoding = 'base64' } = req.body;
 
@@ -266,7 +336,8 @@ app.post('/jito/status', async (req, res) => {
 });
 
 // Send transactions via Constant K (standard sendTransaction RPC)
-app.post('/helius/send-txs', async (req, res) => {
+// Protected: Requires API key if configured
+app.post('/helius/send-txs', requireApiKeyStrict, async (req, res) => {
   try {
     const { transactions } = req.body; // Array of base64 encoded signed transactions
 
@@ -492,7 +563,8 @@ app.get('/grpc/jito/next-leader', async (req, res) => {
 // POST /grpc/jito/bundle - Send bundle via Jito gRPC
 // Request body: { transactions: string[], tipLamports?: number }
 // transactions: Array of base64-encoded signed VersionedTransactions
-app.post('/grpc/jito/bundle', async (req, res) => {
+// Protected: Requires API key if configured
+app.post('/grpc/jito/bundle', requireApiKeyStrict, async (req, res) => {
   try {
     const { transactions, tipLamports } = req.body;
     
@@ -809,7 +881,8 @@ app.get('/grpc/cache/stats', (req, res) => {
 
 // POST /grpc/buy - Execute a buy trade (SOL -> Token)
 // Uses gRPC for fast blockhash + Jito bundle submission
-app.post('/grpc/buy', async (req, res) => {
+// Protected: Requires API key if configured
+app.post('/grpc/buy', requireApiKeyStrict, async (req, res) => {
   try {
     const {
       outputMint,
@@ -850,7 +923,8 @@ app.post('/grpc/buy', async (req, res) => {
 
 // POST /grpc/sell - Execute a sell trade (Token -> SOL)
 // Uses gRPC for fast blockhash + Jito bundle submission
-app.post('/grpc/sell', async (req, res) => {
+// Protected: Requires API key if configured
+app.post('/grpc/sell', requireApiKeyStrict, async (req, res) => {
   try {
     const {
       inputMint,
@@ -890,7 +964,8 @@ app.post('/grpc/sell', async (req, res) => {
 });
 
 // POST /grpc/trade/submit - Submit a signed transaction for a pending trade
-app.post('/grpc/trade/submit', async (req, res) => {
+// Protected: Requires API key if configured
+app.post('/grpc/trade/submit', requireApiKeyStrict, async (req, res) => {
   try {
     const { tradeId, signedTransaction } = req.body;
 
