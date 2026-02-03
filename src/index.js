@@ -692,6 +692,117 @@ app.post('/grpc/blockhash/valid', async (req, res) => {
   }
 });
 
+// --- gRPC Account Data Endpoints ---
+
+// GET /grpc/account/:pubkey - Get account info via gRPC (cached)
+app.get('/grpc/account/:pubkey', async (req, res) => {
+  try {
+    const { pubkey } = req.params;
+    if (!pubkey) {
+      return res.status(400).json({ error: 'pubkey required' });
+    }
+    
+    const result = await accountCache.getAccount(pubkey);
+    
+    res.json({
+      pubkey,
+      data: result.data,
+      owner: result.owner,
+      lamports: result.lamports,
+      executable: result.executable,
+      rentEpoch: result.rentEpoch,
+      slot: result.slot,
+      source: result.source,
+    });
+  } catch (error) {
+    console.error('gRPC account error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /grpc/accounts - Get multiple accounts via gRPC (cached, batched)
+app.post('/grpc/accounts', async (req, res) => {
+  try {
+    const { pubkeys } = req.body;
+    if (!pubkeys || !Array.isArray(pubkeys)) {
+      return res.status(400).json({ error: 'pubkeys array required' });
+    }
+    
+    if (pubkeys.length > 100) {
+      return res.status(400).json({ error: 'Maximum 100 accounts per request' });
+    }
+    
+    const results = await accountCache.getMultipleAccounts(pubkeys);
+    
+    res.json({
+      accounts: results,
+      count: results.length,
+      cached: results.filter(r => r.source === 'cache').length,
+    });
+  } catch (error) {
+    console.error('gRPC accounts error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /grpc/balance/:pubkey - Get SOL balance via gRPC (cached)
+app.get('/grpc/balance/:pubkey', async (req, res) => {
+  try {
+    const { pubkey } = req.params;
+    if (!pubkey) {
+      return res.status(400).json({ error: 'pubkey required' });
+    }
+    
+    const result = await accountCache.getBalance(pubkey);
+    
+    res.json({
+      pubkey,
+      lamports: result.lamports,
+      sol: result.lamports / 1e9,
+      source: result.source,
+    });
+  } catch (error) {
+    console.error('gRPC balance error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /grpc/balances - Get multiple SOL balances via gRPC (cached, batched)
+app.post('/grpc/balances', async (req, res) => {
+  try {
+    const { pubkeys } = req.body;
+    if (!pubkeys || !Array.isArray(pubkeys)) {
+      return res.status(400).json({ error: 'pubkeys array required' });
+    }
+    
+    if (pubkeys.length > 100) {
+      return res.status(400).json({ error: 'Maximum 100 accounts per request' });
+    }
+    
+    const accounts = await accountCache.getMultipleAccounts(pubkeys);
+    const balances = accounts.map(acc => ({
+      pubkey: acc.pubkey,
+      lamports: acc.lamports ? parseInt(acc.lamports) : 0,
+      sol: acc.lamports ? parseInt(acc.lamports) / 1e9 : 0,
+      source: acc.source,
+    }));
+    
+    res.json({
+      balances,
+      count: balances.length,
+    });
+  } catch (error) {
+    console.error('gRPC balances error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /grpc/cache/stats - Get account cache statistics
+app.get('/grpc/cache/stats', (req, res) => {
+  res.json(accountCache.getStats());
+  }
+});
+
 // ============================================================================
 // PHASE 3: UNIFIED BUY/SELL gRPC ENDPOINTS
 // ============================================================================
@@ -1159,6 +1270,215 @@ class YellowstoneGrpcManager {
 
 // Singleton instance
 const yellowstoneGrpc = new YellowstoneGrpcManager();
+
+// --- Account Cache Manager ---
+// Caches account data via gRPC subscriptions to avoid RPC rate limits
+class AccountCacheManager {
+  constructor() {
+    this.accountCache = new Map(); // pubkey -> { data, slot, updatedAt }
+    this.subscriptions = new Map(); // pubkey -> subscription info
+    this.pendingRequests = new Map(); // pubkey -> Promise
+    this.cacheTTL = 5000; // 5 second cache TTL
+    this.maxCacheSize = 1000;
+    this.activeStream = null;
+    this.subscribedAccounts = new Set();
+  }
+
+  // Get account from cache or fetch via gRPC subscription
+  async getAccount(pubkey) {
+    const cached = this.accountCache.get(pubkey);
+    if (cached && Date.now() - cached.updatedAt < this.cacheTTL) {
+      return { ...cached, source: 'cache' };
+    }
+
+    // Check if there's a pending request
+    if (this.pendingRequests.has(pubkey)) {
+      return this.pendingRequests.get(pubkey);
+    }
+
+    // Fetch via subscription snapshot
+    const promise = this._fetchAccountViaSubscription(pubkey);
+    this.pendingRequests.set(pubkey, promise);
+    
+    try {
+      const result = await promise;
+      return result;
+    } finally {
+      this.pendingRequests.delete(pubkey);
+    }
+  }
+
+  // Get multiple accounts (batched)
+  async getMultipleAccounts(pubkeys) {
+    const results = [];
+    const toFetch = [];
+    
+    // Check cache first
+    for (const pubkey of pubkeys) {
+      const cached = this.accountCache.get(pubkey);
+      if (cached && Date.now() - cached.updatedAt < this.cacheTTL) {
+        results.push({ pubkey, ...cached, source: 'cache' });
+      } else {
+        toFetch.push(pubkey);
+      }
+    }
+    
+    // Fetch uncached in parallel
+    if (toFetch.length > 0) {
+      const fetched = await Promise.allSettled(
+        toFetch.map(pubkey => this.getAccount(pubkey))
+      );
+      
+      for (let i = 0; i < toFetch.length; i++) {
+        const result = fetched[i];
+        if (result.status === 'fulfilled') {
+          results.push({ pubkey: toFetch[i], ...result.value });
+        } else {
+          results.push({ pubkey: toFetch[i], data: null, error: result.reason?.message });
+        }
+      }
+    }
+    
+    return results;
+  }
+
+  // Fetch account via gRPC subscription snapshot
+  async _fetchAccountViaSubscription(pubkey) {
+    try {
+      const client = await yellowstoneGrpc.getClient();
+      const stream = await client.subscribe();
+      
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          try { stream.destroy(); } catch {}
+          reject(new Error('Account fetch timeout'));
+        }, 10000);
+        
+        stream.on('data', (data) => {
+          if (data.account && data.account.account) {
+            const acc = data.account.account;
+            const accountData = {
+              data: Buffer.from(acc.data).toString('base64'),
+              owner: acc.owner.toString(),
+              lamports: acc.lamports.toString(),
+              executable: acc.executable,
+              rentEpoch: acc.rentEpoch?.toString() || '0',
+              slot: data.account.slot?.toString(),
+              updatedAt: Date.now(),
+            };
+            
+            this._cacheAccount(pubkey, accountData);
+            clearTimeout(timeout);
+            try { stream.destroy(); } catch {}
+            resolve({ ...accountData, source: 'grpc' });
+          }
+        });
+        
+        stream.on('error', (err) => {
+          clearTimeout(timeout);
+          reject(err);
+        });
+        
+        // Send subscription request for this account
+        stream.write({
+          accounts: {
+            account: {
+              account: [pubkey],
+              owner: [],
+              filters: [],
+            },
+          },
+          commitment: 1, // CONFIRMED
+          accountsDataSlice: [],
+        });
+      });
+    } catch (err) {
+      // Fallback to RPC if gRPC fails
+      console.log(`gRPC account fetch failed for ${pubkey}, falling back to RPC: ${err.message}`);
+      return this._fetchAccountViaRpc(pubkey);
+    }
+  }
+
+  // Fallback to RPC
+  async _fetchAccountViaRpc(pubkey) {
+    if (!RPC_URL) {
+      throw new Error('RPC not configured');
+    }
+    
+    const response = await fetch(RPC_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getAccountInfo',
+        params: [pubkey, { encoding: 'base64', commitment: 'confirmed' }],
+      }),
+    });
+    
+    const result = await response.json();
+    if (result.error) {
+      throw new Error(result.error.message);
+    }
+    
+    const value = result.result?.value;
+    if (!value) {
+      return { data: null, source: 'rpc' };
+    }
+    
+    const accountData = {
+      data: value.data[0],
+      owner: value.owner,
+      lamports: value.lamports.toString(),
+      executable: value.executable,
+      rentEpoch: value.rentEpoch?.toString() || '0',
+      updatedAt: Date.now(),
+    };
+    
+    this._cacheAccount(pubkey, accountData);
+    return { ...accountData, source: 'rpc_fallback' };
+  }
+
+  // Cache account data
+  _cacheAccount(pubkey, data) {
+    // Evict old entries if cache is full
+    if (this.accountCache.size >= this.maxCacheSize) {
+      const oldest = [...this.accountCache.entries()]
+        .sort((a, b) => a[1].updatedAt - b[1].updatedAt)[0];
+      if (oldest) {
+        this.accountCache.delete(oldest[0]);
+      }
+    }
+    
+    this.accountCache.set(pubkey, data);
+  }
+
+  // Get balance via gRPC
+  async getBalance(pubkey) {
+    const account = await this.getAccount(pubkey);
+    return {
+      lamports: account.lamports ? parseInt(account.lamports) : 0,
+      source: account.source,
+    };
+  }
+
+  // Clear cache
+  clearCache() {
+    this.accountCache.clear();
+  }
+
+  // Get cache stats
+  getStats() {
+    return {
+      cacheSize: this.accountCache.size,
+      maxCacheSize: this.maxCacheSize,
+      cacheTTL: this.cacheTTL,
+    };
+  }
+}
+
+// Singleton instance
+const accountCache = new AccountCacheManager();
 
 // --- Trade Service ---
 // Unified service for buy/sell operations using gRPC
