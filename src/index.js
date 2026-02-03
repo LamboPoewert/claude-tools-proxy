@@ -21,28 +21,6 @@ const RPC_URL = process.env.CONSTANTK_RPC_URL || null;
 const KALDERA_GRPC_URL = process.env.KALDERA_GRPC_URL || null;
 const KALDERA_X_TOKEN = process.env.KALDERA_X_TOKEN || null;
 
-// Jito tip accounts (for bundles)
-const JITO_TIP_ACCOUNTS = [
-  '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
-  'HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe',
-  'Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY',
-  'ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49',
-  'DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh',
-];
-
-// Jito block engine endpoints (try regional on "rate limited" / "network congested")
-const JITO_BUNDLE_ENDPOINTS = [
-  'https://mainnet.block-engine.jito.wtf/api/v1/bundles',
-  'https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles',
-  'https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles',
-  'https://dublin.mainnet.block-engine.jito.wtf/api/v1/bundles',
-  'https://london.mainnet.block-engine.jito.wtf/api/v1/bundles',
-  'https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles',
-  'https://singapore.mainnet.block-engine.jito.wtf/api/v1/bundles',
-  'https://tokyo.mainnet.block-engine.jito.wtf/api/v1/bundles',
-  'https://slc.mainnet.block-engine.jito.wtf/api/v1/bundles',
-];
-const JITO_RETRY_DELAY_MS = 800;
 
 // Security middleware
 app.use(helmet());
@@ -169,114 +147,10 @@ app.post('/rpc', async (req, res) => {
   }
 });
 
-// How many Jito endpoints to hit in parallel (increases land rate)
-const JITO_PARALLEL_SEND = 4;
+// Send transactions via Constant K RPC — parallel with batch limiter (max 40 per burst)
+const RPC_BATCH_SIZE = 40; // Stay under 50 TPS limit
+const RPC_BATCH_DELAY_MS = 1100; // 1.1s gap between batches
 
-// Proxy bundle requests to Jito
-// Send bundle to multiple Jito endpoints in parallel so at least one is likely to land
-app.post('/jito/bundle', async (req, res) => {
-  try {
-    const { transactions, encoding = 'base64' } = req.body;
-
-    if (!transactions || !Array.isArray(transactions)) {
-      return res.status(400).json({ error: 'transactions array required' });
-    }
-
-    if (transactions.length > 5) {
-      return res.status(400).json({ error: 'Max 5 transactions per bundle' });
-    }
-
-    console.log(`Sending Jito bundle with ${transactions.length} TXs (${encoding}) to ${JITO_PARALLEL_SEND} endpoints in parallel...`);
-
-    const body = JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'sendBundle',
-      params: [transactions, { encoding }],
-    });
-    const opts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body };
-
-    const urls = JITO_BUNDLE_ENDPOINTS.slice(0, JITO_PARALLEL_SEND);
-    const results = await Promise.allSettled(
-      urls.map((url) =>
-        fetch(url, opts).then((r) => r.json()).then((data) => ({ url, data }))
-      )
-    );
-
-    for (const r of results) {
-      if (r.status !== 'fulfilled') continue;
-      const { url, data } = r.value;
-      if (data.error) continue;
-      const bundleId = data.result && (Array.isArray(data.result) ? data.result[0] : data.result);
-      console.log('Bundle accepted:', bundleId, `(via ${url.split('/')[2]})`);
-      return res.json(data);
-    }
-
-    const lastError = results.find((r) => r.status === 'rejected');
-    const lastData = results.map((r) => r.status === 'fulfilled' && r.value.data).find(Boolean);
-    if (lastData && lastData.error) {
-      return res.json(lastData);
-    }
-    console.error('Jito bundle failed on all endpoints:', lastError?.reason?.message || 'no success');
-    res.status(503).json({ error: lastError?.reason?.message || 'Jito bundle failed on all endpoints' });
-  } catch (error) {
-    console.error('Jito bundle error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get Jito bundle status
-app.post('/jito/status', async (req, res) => {
-  try {
-    const { bundleIds } = req.body;
-
-    const response = await fetch('https://mainnet.block-engine.jito.wtf/api/v1/bundles', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'getBundleStatuses',
-        params: [bundleIds],
-      }),
-    });
-
-    const data = await response.json();
-    res.json(data);
-
-  } catch (error) {
-    console.error('Status error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Check inflight bundle status (faster feedback: Failed/Pending/Landed/Invalid within 5 min)
-app.post('/jito/inflight-status', async (req, res) => {
-  try {
-    const { bundleIds } = req.body;
-
-    const response = await fetch('https://mainnet.block-engine.jito.wtf/api/v1/bundles', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'getInflightBundleStatuses',
-        params: [bundleIds],
-      }),
-    });
-
-    const data = await response.json();
-    res.json(data);
-
-  } catch (error) {
-    console.error('Inflight status error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Send transactions via Constant K (standard sendTransaction RPC)
-// Legacy alias for backwards compatibility
 app.post('/helius/send-txs', (req, res, next) => next());
 app.post('/send-txs', async (req, res) => {
   try {
@@ -290,43 +164,50 @@ app.post('/send-txs', async (req, res) => {
       return res.status(500).json({ error: 'No RPC configured. Set CONSTANTK_RPC_URL in env.' });
     }
 
-    console.log(`Sending ${transactions.length} TXs via Constant K RPC...`);
+    console.log(`Sending ${transactions.length} TXs via Constant K RPC (parallel, batch=${RPC_BATCH_SIZE})...`);
 
-    const results = [];
+    const allResults = new Array(transactions.length);
 
-    for (let i = 0; i < transactions.length; i++) {
+    // Send a single TX to RPC
+    async function sendOne(txBase64, idx) {
       try {
         const response = await fetch(RPC_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             jsonrpc: '2.0',
-            id: Date.now().toString() + '-' + i,
+            id: `tx-${idx}-${Date.now()}`,
             method: 'sendTransaction',
-            params: [
-              transactions[i],
-              { encoding: 'base64', skipPreflight: true },
-            ],
+            params: [txBase64, { encoding: 'base64', skipPreflight: true, maxRetries: 3 }],
           }),
         });
-
         const data = await response.json();
-
         if (data.error) {
-          console.log(`TX ${i + 1} error:`, data.error.message);
-          results.push({ success: false, error: data.error.message });
-        } else {
-          console.log(`TX ${i + 1} sent:`, data.result);
-          results.push({ success: true, signature: data.result });
+          console.log(`TX ${idx + 1} error:`, data.error.message);
+          return { success: false, error: data.error.message };
         }
+        console.log(`TX ${idx + 1} sent:`, data.result);
+        return { success: true, signature: data.result };
       } catch (e) {
-        console.log(`TX ${i + 1} failed:`, e.message);
-        results.push({ success: false, error: e.message });
+        console.log(`TX ${idx + 1} failed:`, e.message);
+        return { success: false, error: e.message };
       }
     }
 
+    // Process in batches of RPC_BATCH_SIZE
+    for (let batchStart = 0; batchStart < transactions.length; batchStart += RPC_BATCH_SIZE) {
+      if (batchStart > 0) await new Promise(r => setTimeout(r, RPC_BATCH_DELAY_MS));
+      const batchEnd = Math.min(batchStart + RPC_BATCH_SIZE, transactions.length);
+      const batchPromises = [];
+      for (let i = batchStart; i < batchEnd; i++) {
+        batchPromises.push(sendOne(transactions[i], i).then(r => { allResults[i] = r; }));
+      }
+      await Promise.allSettled(batchPromises);
+    }
+
+    const results = allResults.map(r => r || { success: false, error: 'unknown' });
     res.json({
-      success: results.every(r => r.success),
+      success: results.some(r => r.success), // true if ANY tx succeeded
       results,
     });
   } catch (error) {
