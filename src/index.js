@@ -229,7 +229,7 @@ app.post('/jito/bundle', async (req, res) => {
 app.post('/jito/status', async (req, res) => {
   try {
     const { bundleIds } = req.body;
-    
+
     const response = await fetch('https://mainnet.block-engine.jito.wtf/api/v1/bundles', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -240,12 +240,37 @@ app.post('/jito/status', async (req, res) => {
         params: [bundleIds],
       }),
     });
-    
+
     const data = await response.json();
     res.json(data);
-    
+
   } catch (error) {
     console.error('Status error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Check inflight bundle status (faster feedback: Failed/Pending/Landed/Invalid within 5 min)
+app.post('/jito/inflight-status', async (req, res) => {
+  try {
+    const { bundleIds } = req.body;
+
+    const response = await fetch('https://mainnet.block-engine.jito.wtf/api/v1/bundles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getInflightBundleStatuses',
+        params: [bundleIds],
+      }),
+    });
+
+    const data = await response.json();
+    res.json(data);
+
+  } catch (error) {
+    console.error('Inflight status error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
