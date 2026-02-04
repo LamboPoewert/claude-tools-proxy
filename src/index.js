@@ -17,6 +17,13 @@ const imageStore = new Map();
 // RPC provider: Constant K only. Set CONSTANTK_RPC_URL in Railway env (full URL with api-key).
 const RPC_URL = process.env.CONSTANTK_RPC_URL || null;
 
+// Helius Sender: dual-send for higher TX landing rate. Set HELIUS_API_KEY in Railway env.
+// Sender is free (no credits), routes through staked connections + Jito simultaneously.
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY || null;
+const HELIUS_SENDER_URL = HELIUS_API_KEY
+  ? `https://sender.helius-rpc.com/fast?api-key=${HELIUS_API_KEY}`
+  : null;
+
 // Kaldera gRPC (Constant K Yellowstone). Set in Railway: KALDERA_GRPC_URL, KALDERA_X_TOKEN.
 const KALDERA_GRPC_URL = process.env.KALDERA_GRPC_URL || null;
 const KALDERA_X_TOKEN = process.env.KALDERA_X_TOKEN || null;
@@ -147,11 +154,12 @@ app.post('/rpc', async (req, res) => {
   }
 });
 
-// Send transactions via Constant K RPC — parallel with batch limiter (max 40 per burst)
-const RPC_BATCH_SIZE = 40; // Stay under 50 TPS limit
+// Send transactions via Constant K RPC + Helius Sender (dual-send for higher landing rate)
+const RPC_BATCH_SIZE = 40; // Stay under 50 TPS limit for Constant K
 const RPC_BATCH_DELAY_MS = 1100; // 1.1s gap between batches
+const HELIUS_BATCH_SIZE = 15; // Helius Sender: 15 TPS limit
+const HELIUS_BATCH_DELAY_MS = 1100;
 
-app.post('/helius/send-txs', (req, res, next) => next());
 app.post('/send-txs', async (req, res) => {
   try {
     const { transactions } = req.body; // Array of base64 encoded signed transactions
@@ -164,12 +172,13 @@ app.post('/send-txs', async (req, res) => {
       return res.status(500).json({ error: 'No RPC configured. Set CONSTANTK_RPC_URL in env.' });
     }
 
-    console.log(`Sending ${transactions.length} TXs via Constant K RPC (parallel, batch=${RPC_BATCH_SIZE})...`);
+    const heliusEnabled = !!HELIUS_SENDER_URL;
+    console.log(`Sending ${transactions.length} TXs via Constant K RPC${heliusEnabled ? ' + Helius Sender' : ''} (parallel)...`);
 
     const allResults = new Array(transactions.length);
 
-    // Send a single TX to RPC
-    async function sendOne(txBase64, idx) {
+    // Send a single TX to Constant K RPC
+    async function sendViaRpc(txBase64, idx) {
       try {
         const response = await fetch(RPC_URL, {
           method: 'POST',
@@ -183,24 +192,77 @@ app.post('/send-txs', async (req, res) => {
         });
         const data = await response.json();
         if (data.error) {
-          console.log(`TX ${idx + 1} error:`, data.error.message);
-          return { success: false, error: data.error.message };
+          return { success: false, error: data.error.message, source: 'rpc' };
         }
-        console.log(`TX ${idx + 1} sent:`, data.result);
-        return { success: true, signature: data.result };
+        return { success: true, signature: data.result, source: 'rpc' };
       } catch (e) {
-        console.log(`TX ${idx + 1} failed:`, e.message);
-        return { success: false, error: e.message };
+        return { success: false, error: e.message, source: 'rpc' };
       }
     }
 
-    // Process in batches of RPC_BATCH_SIZE
-    for (let batchStart = 0; batchStart < transactions.length; batchStart += RPC_BATCH_SIZE) {
-      if (batchStart > 0) await new Promise(r => setTimeout(r, RPC_BATCH_DELAY_MS));
-      const batchEnd = Math.min(batchStart + RPC_BATCH_SIZE, transactions.length);
+    // Send a single TX to Helius Sender
+    async function sendViaHelius(txBase64, idx) {
+      try {
+        const response = await fetch(HELIUS_SENDER_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: `helius-${idx}-${Date.now()}`,
+            method: 'sendTransaction',
+            params: [txBase64, { encoding: 'base64', skipPreflight: true, maxRetries: 0 }],
+          }),
+        });
+        const data = await response.json();
+        if (data.error) {
+          return { success: false, error: data.error.message, source: 'helius' };
+        }
+        return { success: true, signature: data.result, source: 'helius' };
+      } catch (e) {
+        return { success: false, error: e.message, source: 'helius' };
+      }
+    }
+
+    // Dual-send: fire each TX to both Constant K and Helius Sender in parallel.
+    // Use the first successful result (both return the same signature for the same signed TX).
+    async function sendOneDual(txBase64, idx) {
+      const promises = [sendViaRpc(txBase64, idx)];
+      if (heliusEnabled) {
+        promises.push(sendViaHelius(txBase64, idx));
+      }
+      const results = await Promise.allSettled(promises);
+
+      // Pick the first successful result
+      for (const r of results) {
+        if (r.status === 'fulfilled' && r.value.success) {
+          const src = r.value.source;
+          console.log(`TX ${idx + 1} sent via ${src}: ${r.value.signature}`);
+          // Log if the other path also succeeded
+          const otherResults = results.filter(o => o !== r && o.status === 'fulfilled' && o.value.success);
+          if (otherResults.length > 0) {
+            console.log(`TX ${idx + 1} also accepted by ${otherResults[0].value.source}`);
+          }
+          return { success: true, signature: r.value.signature };
+        }
+      }
+
+      // Both failed — return the RPC error (primary)
+      const rpcResult = results[0];
+      const errMsg = rpcResult.status === 'fulfilled' ? rpcResult.value.error : rpcResult.reason?.message;
+      console.log(`TX ${idx + 1} failed on all paths:`, errMsg);
+      return { success: false, error: errMsg || 'unknown' };
+    }
+
+    // Process in batches (use the smaller batch size to respect both rate limits)
+    const batchSize = heliusEnabled ? Math.min(RPC_BATCH_SIZE, HELIUS_BATCH_SIZE) : RPC_BATCH_SIZE;
+    const batchDelay = heliusEnabled ? Math.max(RPC_BATCH_DELAY_MS, HELIUS_BATCH_DELAY_MS) : RPC_BATCH_DELAY_MS;
+
+    for (let batchStart = 0; batchStart < transactions.length; batchStart += batchSize) {
+      if (batchStart > 0) await new Promise(r => setTimeout(r, batchDelay));
+      const batchEnd = Math.min(batchStart + batchSize, transactions.length);
       const batchPromises = [];
       for (let i = batchStart; i < batchEnd; i++) {
-        batchPromises.push(sendOne(transactions[i], i).then(r => { allResults[i] = r; }));
+        batchPromises.push(sendOneDual(transactions[i], i).then(r => { allResults[i] = r; }));
       }
       await Promise.allSettled(batchPromises);
     }
@@ -617,6 +679,7 @@ wssPositions.on('connection', (ws) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Claude Tools Proxy running on port ${PORT}`);
   console.log(`   RPC: ${RPC_URL ? 'Constant K ✓' : 'NOT SET ✗ (set CONSTANTK_RPC_URL in env)'}`);
+  console.log(`   Helius Sender: ${HELIUS_SENDER_URL ? '✓ (dual-send enabled)' : 'NOT SET (optional: HELIUS_API_KEY)'}`);
   console.log(`   Kaldera gRPC: ${KALDERA_GRPC_URL && KALDERA_X_TOKEN ? '✓' : 'NOT SET (optional: KALDERA_GRPC_URL, KALDERA_X_TOKEN)'}`);
   console.log(`   Positions: wss://<host>/ws/positions`);
 });
