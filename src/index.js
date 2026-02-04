@@ -43,6 +43,36 @@ app.get('/', (req, res) => {
   });
 });
 
+app.get('/health', async (req, res) => {
+  const health = {
+    status: 'ok',
+    uptime: Math.floor(process.uptime()),
+    timestamp: Date.now(),
+    rpc: { configured: !!RPC_URL },
+    helius: { configured: !!HELIUS_SENDER_URL },
+  };
+
+  // Quick RPC ping — getHealth is free and fast
+  if (RPC_URL) {
+    try {
+      const rpcRes = await fetch(RPC_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' }),
+        signal: AbortSignal.timeout(3000),
+      });
+      const rpcData = await rpcRes.json();
+      health.rpc.status = rpcData.result === 'ok' ? 'ok' : 'degraded';
+    } catch (e) {
+      health.rpc.status = 'down';
+      health.status = 'degraded';
+    }
+  }
+
+  const httpCode = health.status === 'ok' ? 200 : 503;
+  res.status(httpCode).json(health);
+});
+
 // Rate limiting - 2000 requests per 15 minutes per IP (applies to /rpc, /send-txs, /metadata, etc.; GET / is exempt)
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
