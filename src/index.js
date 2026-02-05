@@ -5,6 +5,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,10 +13,15 @@ const PORT = process.env.PORT || 3000;
 // Admin secret for stats endpoint — set ADMIN_SECRET in Railway env
 const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
 
+// Supabase for persistent stats — set SUPABASE_URL and SUPABASE_KEY in Railway env
+const SUPABASE_URL = process.env.SUPABASE_URL || null;
+const SUPABASE_KEY = process.env.SUPABASE_KEY || null;
+const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+
 // ============== STATS TRACKING ==============
 const stats = {
   startTime: Date.now(),
-  uniqueUsers: new Set(), // Track by IP
+  uniqueUsers: new Set(), // Track by IP (in-memory only)
   totalTransactions: 0,   // Individual TXs sent via /send-txs
   totalRpcCalls: 0,       // Calls to /rpc endpoint
   totalSendTxCalls: 0,    // Calls to /send-txs endpoint
@@ -29,6 +35,132 @@ const stats = {
   buys: 0,
   sells: 0,
 };
+
+// Load cumulative stats from Supabase on startup
+async function loadStatsFromDb() {
+  if (!supabase) return;
+  try {
+    const { data, error } = await supabase
+      .from('cumulative_stats')
+      .select('*')
+      .eq('id', 1)
+      .single();
+    if (error && error.code !== 'PGRST116') { // PGRST116 = no rows
+      console.error('Failed to load stats from DB:', error.message);
+      return;
+    }
+    if (data) {
+      stats.totalTransactions = data.total_transactions || 0;
+      stats.totalRpcCalls = data.total_rpc_calls || 0;
+      stats.totalSendTxCalls = data.total_send_tx_calls || 0;
+      stats.totalMetadataCreated = data.total_metadata_created || 0;
+      stats.totalImagesUploaded = data.total_images_uploaded || 0;
+      stats.totalSolVolume = data.total_sol_volume || 0;
+      stats.totalFeesEarned = data.total_fees_earned || 0;
+      stats.launches = data.launches || 0;
+      stats.buys = data.buys || 0;
+      stats.sells = data.sells || 0;
+      console.log('✓ Loaded cumulative stats from Supabase');
+    }
+  } catch (e) {
+    console.error('Error loading stats:', e.message);
+  }
+}
+
+// Save cumulative stats to Supabase
+async function saveStatsToDb() {
+  if (!supabase) return;
+  try {
+    const { error } = await supabase
+      .from('cumulative_stats')
+      .upsert({
+        id: 1,
+        total_transactions: stats.totalTransactions,
+        total_rpc_calls: stats.totalRpcCalls,
+        total_send_tx_calls: stats.totalSendTxCalls,
+        total_metadata_created: stats.totalMetadataCreated,
+        total_images_uploaded: stats.totalImagesUploaded,
+        total_sol_volume: stats.totalSolVolume,
+        total_fees_earned: stats.totalFeesEarned,
+        launches: stats.launches,
+        buys: stats.buys,
+        sells: stats.sells,
+        updated_at: new Date().toISOString(),
+      });
+    if (error) console.error('Failed to save stats:', error.message);
+  } catch (e) {
+    console.error('Error saving stats:', e.message);
+  }
+}
+
+// Record an operation to Supabase (for daily/weekly/monthly charts)
+async function recordOperation(type, solAmount = 0, feeAmount = 0) {
+  if (!supabase) return;
+  try {
+    await supabase.from('operations').insert({
+      type,
+      sol_amount: solAmount,
+      fee_amount: feeAmount,
+      created_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    // Silent fail — don't break the app
+  }
+}
+
+// Get aggregated stats for a time period
+async function getAggregatedStats(days) {
+  if (!supabase) return null;
+  try {
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const { data, error } = await supabase
+      .from('operations')
+      .select('type, sol_amount, fee_amount')
+      .gte('created_at', since);
+    if (error) return null;
+
+    const result = { launches: 0, buys: 0, sells: 0, solVolume: 0, fees: 0 };
+    for (const op of data || []) {
+      if (op.type === 'launch') result.launches++;
+      else if (op.type === 'buy') result.buys++;
+      else if (op.type === 'sell') result.sells++;
+      result.solVolume += op.sol_amount || 0;
+      result.fees += op.fee_amount || 0;
+    }
+    return result;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Get daily stats for chart (last 7 or 30 days)
+async function getDailyStats(days) {
+  if (!supabase) return [];
+  try {
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const { data, error } = await supabase
+      .from('operations')
+      .select('type, sol_amount, fee_amount, created_at')
+      .gte('created_at', since)
+      .order('created_at', { ascending: true });
+    if (error) return [];
+
+    // Group by day
+    const byDay = {};
+    for (const op of data || []) {
+      const day = op.created_at.split('T')[0];
+      if (!byDay[day]) byDay[day] = { launches: 0, buys: 0, sells: 0, volume: 0, fees: 0 };
+      if (op.type === 'launch') byDay[day].launches++;
+      else if (op.type === 'buy') byDay[day].buys++;
+      else if (op.type === 'sell') byDay[day].sells++;
+      byDay[day].volume += op.sol_amount || 0;
+      byDay[day].fees += op.fee_amount || 0;
+    }
+    return Object.entries(byDay).map(([date, stats]) => ({ date, ...stats }));
+  } catch (e) {
+    return [];
+  }
+}
 
 function trackUser(req) {
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.connection?.remoteAddress || 'unknown';
@@ -70,7 +202,7 @@ app.get('/', (req, res) => {
 });
 
 // ============== ADMIN DASHBOARD (HTML) ==============
-app.get('/admin', (req, res) => {
+app.get('/admin', async (req, res) => {
   const secret = req.query.secret;
 
   // Check auth
@@ -90,6 +222,14 @@ app.get('/admin', (req, res) => {
       ? parseFloat(uptimeHours).toFixed(1) + ' hours'
       : Math.floor(uptimeSeconds / 60) + ' min';
 
+  // Fetch time-based stats from Supabase (if available)
+  const daily = await getAggregatedStats(1);
+  const weekly = await getAggregatedStats(7);
+  const monthly = await getAggregatedStats(30);
+  const chartData = await getDailyStats(14); // Last 14 days for charts
+
+  const hasTimeStats = daily !== null;
+
   res.setHeader('Content-Type', 'text/html');
   res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -97,7 +237,8 @@ app.get('/admin', (req, res) => {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Admin Dashboard - Claude Tools Proxy</title>
-  <meta http-equiv="refresh" content="30">
+  <meta http-equiv="refresh" content="60">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -105,6 +246,7 @@ app.get('/admin', (req, res) => {
       background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
       min-height: 100vh;
       color: #e4e4e7;
+      padding-bottom: 2rem;
     }
     .container { max-width: 1200px; margin: 0 auto; padding: 1rem; }
     h1 {
@@ -112,6 +254,13 @@ app.get('/admin', (req, res) => {
       margin-bottom: 1.5rem;
       color: #22d3ee;
       text-align: center;
+    }
+    h2 {
+      font-size: 1.1rem;
+      margin: 1.5rem 0 1rem;
+      color: #94a3b8;
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+      padding-bottom: 0.5rem;
     }
     .stats-grid {
       display: grid;
@@ -139,6 +288,9 @@ app.get('/admin', (req, res) => {
     .stat-card .sub { font-size: 0.7rem; color: #64748b; }
     .stat-card.highlight { border-color: rgba(34, 211, 238, 0.3); background: rgba(34, 211, 238, 0.1); }
     .stat-card.highlight .value { color: #4ade80; }
+    .stat-card.green .value { color: #4ade80; }
+    .stat-card.yellow .value { color: #facc15; }
+    .stat-card.purple .value { color: #a78bfa; }
     .breakdown-item {
       display: flex;
       justify-content: space-between;
@@ -147,58 +299,245 @@ app.get('/admin', (req, res) => {
     }
     .breakdown-item .label { color: #94a3b8; }
     .breakdown-item .val { color: #e4e4e7; font-weight: 600; }
+    .chart-container {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      padding: 1rem;
+      margin-bottom: 1rem;
+    }
+    .chart-container canvas {
+      max-height: 250px;
+    }
+    .time-cards {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+    @media (max-width: 600px) {
+      .time-cards { grid-template-columns: 1fr; }
+    }
+    .time-card {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      padding: 1rem;
+    }
+    .time-card h4 {
+      font-size: 0.8rem;
+      color: #94a3b8;
+      margin-bottom: 0.5rem;
+      text-transform: uppercase;
+    }
+    .time-card .big-value {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #4ade80;
+    }
+    .time-card .small-stats {
+      margin-top: 0.5rem;
+      font-size: 0.75rem;
+      color: #64748b;
+    }
     .refresh-info { text-align: center; color: #64748b; font-size: 0.75rem; margin-top: 1rem; }
+    .no-supabase {
+      background: rgba(250, 204, 21, 0.1);
+      border: 1px solid rgba(250, 204, 21, 0.3);
+      border-radius: 8px;
+      padding: 0.75rem;
+      font-size: 0.85rem;
+      color: #facc15;
+      text-align: center;
+      margin-bottom: 1rem;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>Admin Dashboard</h1>
 
+    <!-- All-Time Stats -->
     <div class="stats-grid">
       <div class="stat-card">
         <h3>Uptime</h3>
         <div class="value">${uptimeStr}</div>
-        <div class="sub">since ${new Date(stats.startTime).toLocaleDateString()}</div>
+        <div class="sub">since restart</div>
       </div>
       <div class="stat-card">
         <h3>Users</h3>
         <div class="value">${stats.uniqueUsers.size}</div>
-        <div class="sub">unique IPs</div>
+        <div class="sub">unique IPs (session)</div>
       </div>
       <div class="stat-card highlight">
-        <h3>SOL Volume</h3>
+        <h3>Total SOL Volume</h3>
         <div class="value">${stats.totalSolVolume.toFixed(2)}</div>
-        <div class="sub">SOL</div>
+        <div class="sub">SOL (all time)</div>
       </div>
       <div class="stat-card highlight">
-        <h3>Fees (1%)</h3>
+        <h3>Total Fees (1%)</h3>
         <div class="value">${stats.totalFeesEarned.toFixed(4)}</div>
-        <div class="sub">SOL</div>
+        <div class="sub">SOL (all time)</div>
       </div>
     </div>
 
     <div class="stat-card" style="margin-bottom:1rem">
-      <h3>Operations</h3>
+      <h3>All-Time Operations</h3>
       <div class="breakdown-item"><span class="label">Launches</span><span class="val">${stats.launches}</span></div>
       <div class="breakdown-item"><span class="label">Buys</span><span class="val">${stats.buys}</span></div>
       <div class="breakdown-item"><span class="label">Sells</span><span class="val">${stats.sells}</span></div>
     </div>
 
+    ${!hasTimeStats ? `
+    <div class="no-supabase">
+      Supabase not configured — daily/weekly/monthly stats unavailable.<br>
+      Set SUPABASE_URL and SUPABASE_KEY in Railway to enable.
+    </div>
+    ` : `
+    <!-- Time-Based Stats -->
+    <h2>Time-Based Stats</h2>
+    <div class="time-cards">
+      <div class="time-card">
+        <h4>Today (24h)</h4>
+        <div class="big-value">${daily.solVolume.toFixed(2)} SOL</div>
+        <div class="small-stats">
+          Fees: ${daily.fees.toFixed(4)} SOL<br>
+          ${daily.launches} launches · ${daily.buys} buys · ${daily.sells} sells
+        </div>
+      </div>
+      <div class="time-card">
+        <h4>Last 7 Days</h4>
+        <div class="big-value">${weekly.solVolume.toFixed(2)} SOL</div>
+        <div class="small-stats">
+          Fees: ${weekly.fees.toFixed(4)} SOL<br>
+          ${weekly.launches} launches · ${weekly.buys} buys · ${weekly.sells} sells
+        </div>
+      </div>
+      <div class="time-card">
+        <h4>Last 30 Days</h4>
+        <div class="big-value">${monthly.solVolume.toFixed(2)} SOL</div>
+        <div class="small-stats">
+          Fees: ${monthly.fees.toFixed(4)} SOL<br>
+          ${monthly.launches} launches · ${monthly.buys} buys · ${monthly.sells} sells
+        </div>
+      </div>
+    </div>
+
+    <!-- Charts -->
+    <h2>Volume Chart (Last 14 Days)</h2>
+    <div class="chart-container">
+      <canvas id="volumeChart"></canvas>
+    </div>
+
+    <h2>Operations Chart (Last 14 Days)</h2>
+    <div class="chart-container">
+      <canvas id="opsChart"></canvas>
+    </div>
+    `}
+
     <div class="stat-card" style="margin-bottom:1rem">
-      <h3>Transactions</h3>
+      <h3>Proxy Stats (Session)</h3>
       <div class="breakdown-item"><span class="label">Total TXs</span><span class="val">${stats.totalTransactions}</span></div>
       <div class="breakdown-item"><span class="label">Send-TX Calls</span><span class="val">${stats.totalSendTxCalls}</span></div>
       <div class="breakdown-item"><span class="label">RPC Calls</span><span class="val">${stats.totalRpcCalls}</span></div>
+      <div class="breakdown-item"><span class="label">Metadata Created</span><span class="val">${stats.totalMetadataCreated}</span></div>
+      <div class="breakdown-item"><span class="label">Images Uploaded</span><span class="val">${stats.totalImagesUploaded}</span></div>
     </div>
 
-    <div class="stat-card">
-      <h3>Metadata</h3>
-      <div class="breakdown-item"><span class="label">Created</span><span class="val">${stats.totalMetadataCreated}</span></div>
-      <div class="breakdown-item"><span class="label">Images</span><span class="val">${stats.totalImagesUploaded}</span></div>
-    </div>
-
-    <div class="refresh-info">Auto-refreshes every 30 seconds</div>
+    <div class="refresh-info">Auto-refreshes every 60 seconds</div>
   </div>
+
+  ${hasTimeStats ? `
+  <script>
+    const chartData = ${JSON.stringify(chartData)};
+    const labels = chartData.map(d => d.date.slice(5)); // MM-DD format
+
+    // Volume Chart
+    new Chart(document.getElementById('volumeChart'), {
+      type: 'bar',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'SOL Volume',
+          data: chartData.map(d => d.volume),
+          backgroundColor: 'rgba(34, 211, 238, 0.6)',
+          borderColor: 'rgba(34, 211, 238, 1)',
+          borderWidth: 1
+        }, {
+          label: 'Fees',
+          data: chartData.map(d => d.fees),
+          backgroundColor: 'rgba(74, 222, 128, 0.6)',
+          borderColor: 'rgba(74, 222, 128, 1)',
+          borderWidth: 1
+        }]
+      },
+      options: {
+        responsive: true,
+        scales: {
+          y: {
+            beginAtZero: true,
+            grid: { color: 'rgba(255,255,255,0.1)' },
+            ticks: { color: '#94a3b8' }
+          },
+          x: {
+            grid: { display: false },
+            ticks: { color: '#94a3b8' }
+          }
+        },
+        plugins: {
+          legend: { labels: { color: '#e4e4e7' } }
+        }
+      }
+    });
+
+    // Operations Chart
+    new Chart(document.getElementById('opsChart'), {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Launches',
+          data: chartData.map(d => d.launches),
+          borderColor: '#f472b6',
+          backgroundColor: 'rgba(244, 114, 182, 0.2)',
+          tension: 0.3,
+          fill: true
+        }, {
+          label: 'Buys',
+          data: chartData.map(d => d.buys),
+          borderColor: '#4ade80',
+          backgroundColor: 'rgba(74, 222, 128, 0.2)',
+          tension: 0.3,
+          fill: true
+        }, {
+          label: 'Sells',
+          data: chartData.map(d => d.sells),
+          borderColor: '#f87171',
+          backgroundColor: 'rgba(248, 113, 113, 0.2)',
+          tension: 0.3,
+          fill: true
+        }]
+      },
+      options: {
+        responsive: true,
+        scales: {
+          y: {
+            beginAtZero: true,
+            grid: { color: 'rgba(255,255,255,0.1)' },
+            ticks: { color: '#94a3b8' }
+          },
+          x: {
+            grid: { display: false },
+            ticks: { color: '#94a3b8' }
+          }
+        },
+        plugins: {
+          legend: { labels: { color: '#e4e4e7' } }
+        }
+      }
+    });
+  </script>
+  ` : ''}
 </body>
 </html>`);
 });
@@ -252,19 +591,25 @@ app.post('/stats/report', (req, res) => {
   try {
     trackUser(req);
     const { type, solAmount, feeAmount } = req.body || {};
+    const sol = typeof solAmount === 'number' ? solAmount : 0;
+    const fee = typeof feeAmount === 'number' ? feeAmount : 0;
 
     if (type === 'launch') {
       stats.launches++;
-      if (typeof solAmount === 'number') stats.totalSolVolume += solAmount;
-      if (typeof feeAmount === 'number') stats.totalFeesEarned += feeAmount;
+      stats.totalSolVolume += sol;
+      stats.totalFeesEarned += fee;
     } else if (type === 'buy') {
       stats.buys++;
-      if (typeof solAmount === 'number') stats.totalSolVolume += solAmount;
-      if (typeof feeAmount === 'number') stats.totalFeesEarned += feeAmount;
+      stats.totalSolVolume += sol;
+      stats.totalFeesEarned += fee;
     } else if (type === 'sell') {
       stats.sells++;
       // Sells don't add to SOL volume (they're token→SOL)
     }
+
+    // Save to Supabase (async, don't wait)
+    recordOperation(type, sol, fee);
+    saveStatsToDb();
 
     res.json({ ok: true });
   } catch (e) {
@@ -946,11 +1291,17 @@ wssPositions.on('connection', (ws) => {
 });
 
 // Start server (0.0.0.0 so Railway/containers can reach healthcheck)
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', async () => {
   console.log(`🚀 Claude Tools Proxy running on port ${PORT}`);
   console.log(`   RPC: ${RPC_URL ? 'Constant K ✓' : 'NOT SET ✗ (set CONSTANTK_RPC_URL in env)'}`);
   console.log(`   Helius Sender: ${HELIUS_SENDER_URL ? '✓ (dual-send enabled)' : 'NOT SET (optional: HELIUS_API_KEY)'}`);
   console.log(`   Kaldera gRPC: ${KALDERA_GRPC_URL && KALDERA_X_TOKEN ? '✓' : 'NOT SET (optional: KALDERA_GRPC_URL, KALDERA_X_TOKEN)'}`);
   console.log(`   Admin Stats: ${ADMIN_SECRET ? '✓ (/admin/stats?secret=...)' : 'NOT SET (optional: ADMIN_SECRET)'}`);
+  console.log(`   Supabase: ${supabase ? '✓ (persistent stats)' : 'NOT SET (optional: SUPABASE_URL, SUPABASE_KEY)'}`);
   console.log(`   Positions: wss://<host>/ws/positions`);
+
+  // Load cumulative stats from Supabase on startup
+  if (supabase) {
+    await loadStatsFromDb();
+  }
 });
