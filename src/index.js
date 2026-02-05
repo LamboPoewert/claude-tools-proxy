@@ -9,6 +9,32 @@ const { WebSocketServer } = require('ws');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Admin secret for stats endpoint — set ADMIN_SECRET in Railway env
+const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
+
+// ============== STATS TRACKING ==============
+const stats = {
+  startTime: Date.now(),
+  uniqueUsers: new Set(), // Track by IP
+  totalTransactions: 0,   // Individual TXs sent via /send-txs
+  totalRpcCalls: 0,       // Calls to /rpc endpoint
+  totalSendTxCalls: 0,    // Calls to /send-txs endpoint
+  totalMetadataCreated: 0,
+  totalImagesUploaded: 0,
+  // These require desktop app to report (added via /stats/report endpoint)
+  totalSolVolume: 0,      // SOL volume from buys
+  totalFeesEarned: 0,     // 1% fees collected
+  // Breakdown by action type
+  launches: 0,
+  buys: 0,
+  sells: 0,
+};
+
+function trackUser(req) {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.connection?.remoteAddress || 'unknown';
+  stats.uniqueUsers.add(ip);
+}
+
 // In-memory store for token metadata (Metaplex-style JSON) — keyed by short id, served at GET /metadata/:id
 const metadataStore = new Map();
 // In-memory store for uploaded images — keyed by short id, value: { buffer, mimeType }
@@ -41,6 +67,75 @@ app.get('/', (req, res) => {
     service: 'Claude Tools Proxy',
     version: '1.0.0'
   });
+});
+
+// ============== ADMIN STATS ENDPOINT ==============
+app.get('/admin/stats', (req, res) => {
+  // Check auth — require ?secret=ADMIN_SECRET or Authorization header
+  const secret = req.query.secret || req.headers.authorization?.replace('Bearer ', '');
+  if (!ADMIN_SECRET) {
+    return res.status(503).json({ error: 'ADMIN_SECRET not configured on server' });
+  }
+  if (secret !== ADMIN_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const uptimeSeconds = Math.floor((Date.now() - stats.startTime) / 1000);
+  const uptimeHours = (uptimeSeconds / 3600).toFixed(2);
+
+  res.json({
+    uptime: {
+      seconds: uptimeSeconds,
+      hours: parseFloat(uptimeHours),
+      since: new Date(stats.startTime).toISOString(),
+    },
+    users: {
+      unique: stats.uniqueUsers.size,
+    },
+    transactions: {
+      total: stats.totalTransactions,
+      sendTxCalls: stats.totalSendTxCalls,
+      breakdown: {
+        launches: stats.launches,
+        buys: stats.buys,
+        sells: stats.sells,
+      },
+    },
+    rpcCalls: stats.totalRpcCalls,
+    metadata: {
+      created: stats.totalMetadataCreated,
+      imagesUploaded: stats.totalImagesUploaded,
+    },
+    volume: {
+      totalSolBought: stats.totalSolVolume,
+      feesEarned: stats.totalFeesEarned,
+    },
+  });
+});
+
+// Endpoint for desktop app to report volume/fees (called after successful operations)
+app.post('/stats/report', (req, res) => {
+  try {
+    trackUser(req);
+    const { type, solAmount, feeAmount } = req.body || {};
+
+    if (type === 'launch') {
+      stats.launches++;
+      if (typeof solAmount === 'number') stats.totalSolVolume += solAmount;
+      if (typeof feeAmount === 'number') stats.totalFeesEarned += feeAmount;
+    } else if (type === 'buy') {
+      stats.buys++;
+      if (typeof solAmount === 'number') stats.totalSolVolume += solAmount;
+      if (typeof feeAmount === 'number') stats.totalFeesEarned += feeAmount;
+    } else if (type === 'sell') {
+      stats.sells++;
+      // Sells don't add to SOL volume (they're token→SOL)
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/health', async (req, res) => {
@@ -86,6 +181,8 @@ app.use(limiter);
 // Token metadata: POST to create (returns URI), GET /metadata/:id to fetch JSON (for pump.fun / explorers)
 // POST body: { name, symbol, description?, image?, twitter?, telegram?, website? }
 app.post('/metadata', (req, res) => {
+  trackUser(req);
+  stats.totalMetadataCreated++;
   try {
     const { name, symbol, description, image, twitter, telegram, website } = req.body || {};
     if (!name || !symbol) {
@@ -129,6 +226,8 @@ app.get('/metadata/:id', (req, res) => {
 
 // Image upload: POST body { image: base64String, mimeType?: 'image/png' | 'image/jpeg' | ... } → returns { url }
 app.post('/metadata/image', (req, res) => {
+  trackUser(req);
+  stats.totalImagesUploaded++;
   try {
     const { image, mimeType } = req.body || {};
     if (!image || typeof image !== 'string') {
@@ -163,6 +262,8 @@ app.get('/metadata/image/:id', (req, res) => {
 
 // Proxy RPC requests to Constant K
 app.post('/rpc', async (req, res) => {
+  trackUser(req);
+  stats.totalRpcCalls++;
   try {
     if (!RPC_URL) {
       return res.status(500).json({
@@ -191,12 +292,17 @@ const HELIUS_BATCH_SIZE = 15; // Helius Sender: 15 TPS limit
 const HELIUS_BATCH_DELAY_MS = 1100;
 
 app.post('/send-txs', async (req, res) => {
+  trackUser(req);
+  stats.totalSendTxCalls++;
   try {
     const { transactions } = req.body; // Array of base64 encoded signed transactions
 
     if (!transactions || !Array.isArray(transactions)) {
       return res.status(400).json({ error: 'transactions array required (base64 encoded)' });
     }
+
+    // Track individual transactions
+    stats.totalTransactions += transactions.length;
 
     if (!RPC_URL) {
       return res.status(500).json({ error: 'No RPC configured. Set CONSTANTK_RPC_URL in env.' });
@@ -711,5 +817,6 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`   RPC: ${RPC_URL ? 'Constant K ✓' : 'NOT SET ✗ (set CONSTANTK_RPC_URL in env)'}`);
   console.log(`   Helius Sender: ${HELIUS_SENDER_URL ? '✓ (dual-send enabled)' : 'NOT SET (optional: HELIUS_API_KEY)'}`);
   console.log(`   Kaldera gRPC: ${KALDERA_GRPC_URL && KALDERA_X_TOKEN ? '✓' : 'NOT SET (optional: KALDERA_GRPC_URL, KALDERA_X_TOKEN)'}`);
+  console.log(`   Admin Stats: ${ADMIN_SECRET ? '✓ (/admin/stats?secret=...)' : 'NOT SET (optional: ADMIN_SECRET)'}`);
   console.log(`   Positions: wss://<host>/ws/positions`);
 });
