@@ -263,132 +263,141 @@ app.get('/admin', (req, res) => {
   </div>
 
   <script>
-    document.addEventListener('DOMContentLoaded', function() {
+    (function() {
       let adminSecret = '';
       let refreshInterval = null;
 
-      const secretInput = document.getElementById('secretInput');
-      const loginBtn = document.getElementById('loginBtn');
-      const loginError = document.getElementById('loginError');
-      const loginBox = document.getElementById('loginBox');
-      const dashboard = document.getElementById('dashboard');
+      function init() {
+        const secretInput = document.getElementById('secretInput');
+        const loginBtn = document.getElementById('loginBtn');
+        const loginError = document.getElementById('loginError');
+        const loginBox = document.getElementById('loginBox');
+        const dashboard = document.getElementById('dashboard');
 
-      // Attach event listeners immediately
-      loginBtn.addEventListener('click', function() {
-        login();
-      });
-
-      secretInput.addEventListener('keydown', function(e) {
-        if (e.key === 'Enter') {
-          e.preventDefault();
+        // Attach event listeners
+        loginBtn.addEventListener('click', function() {
           login();
-        }
-      });
+        });
 
-      // Check localStorage for saved secret
-      const saved = localStorage.getItem('adminSecret');
-      if (saved) {
-        adminSecret = saved;
-        tryAutoLogin();
-      }
-
-      async function tryAutoLogin() {
-        try {
-          const res = await fetch('/admin/stats?secret=' + encodeURIComponent(adminSecret));
-          if (res.ok) {
-            showDashboard();
-            loadStats();
-          } else {
-            localStorage.removeItem('adminSecret');
-            adminSecret = '';
+        secretInput.addEventListener('keydown', function(e) {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            login();
           }
-        } catch (e) {
-          localStorage.removeItem('adminSecret');
-        }
-      }
+        });
 
-      async function login() {
-        adminSecret = secretInput.value.trim();
-
-        if (!adminSecret) {
-          loginError.textContent = 'Please enter the admin secret';
-          return;
+        // Check localStorage for saved secret
+        const saved = localStorage.getItem('adminSecret');
+        if (saved) {
+          adminSecret = saved;
+          tryAutoLogin();
         }
 
-        try {
-          const res = await fetch('/admin/stats?secret=' + encodeURIComponent(adminSecret));
-          if (res.ok) {
-            localStorage.setItem('adminSecret', adminSecret);
-            loginError.textContent = '';
-            showDashboard();
-            loadStats();
-          } else if (res.status === 401) {
-            loginError.textContent = 'Invalid admin secret';
-          } else {
-            const data = await res.json();
-            loginError.textContent = data.error || 'Error accessing stats';
-          }
-        } catch (e) {
-          loginError.textContent = 'Network error';
-        }
-      }
-
-      function showDashboard() {
-        loginBox.style.display = 'none';
-        dashboard.style.display = 'block';
-        refreshInterval = setInterval(loadStats, 30000);
-      }
-
-      async function loadStats() {
-        try {
-          const res = await fetch('/admin/stats?secret=' + encodeURIComponent(adminSecret));
-          if (!res.ok) {
-            if (res.status === 401) {
+        async function tryAutoLogin() {
+          try {
+            const res = await fetch('/admin/stats?secret=' + encodeURIComponent(adminSecret));
+            if (res.ok) {
+              showDashboard();
+              loadStats();
+            } else {
               localStorage.removeItem('adminSecret');
-              location.reload();
+              adminSecret = '';
             }
+          } catch (e) {
+            localStorage.removeItem('adminSecret');
+          }
+        }
+
+        async function login() {
+          adminSecret = secretInput.value.trim();
+
+          if (!adminSecret) {
+            loginError.textContent = 'Please enter the admin secret';
             return;
           }
-          const data = await res.json();
 
-          // Uptime
-          const hours = data.uptime.hours;
-          const uptimeStr = hours >= 24
-            ? (hours / 24).toFixed(1) + ' days'
-            : hours >= 1
-              ? hours.toFixed(1) + ' hours'
-              : Math.floor(data.uptime.seconds / 60) + ' min';
-          document.getElementById('uptime').textContent = uptimeStr;
-          document.getElementById('since').textContent = 'since ' + new Date(data.uptime.since).toLocaleString();
+          try {
+            const res = await fetch('/admin/stats?secret=' + encodeURIComponent(adminSecret));
+            if (res.ok) {
+              localStorage.setItem('adminSecret', adminSecret);
+              loginError.textContent = '';
+              showDashboard();
+              loadStats();
+            } else if (res.status === 401) {
+              loginError.textContent = 'Invalid admin secret';
+            } else {
+              const data = await res.json();
+              loginError.textContent = data.error || 'Error accessing stats';
+            }
+          } catch (e) {
+            loginError.textContent = 'Network error';
+          }
+        }
 
-          // Users
-          document.getElementById('uniqueUsers').textContent = data.users.unique.toLocaleString();
+        function showDashboard() {
+          loginBox.style.display = 'none';
+          dashboard.style.display = 'block';
+          refreshInterval = setInterval(loadStats, 30000);
+        }
 
-          // Volume & Fees
-          document.getElementById('solVolume').textContent = data.volume.totalSolBought.toFixed(4) + ' SOL';
-          document.getElementById('feesEarned').textContent = data.volume.feesEarned.toFixed(4) + ' SOL';
+        async function loadStats() {
+          try {
+            const res = await fetch('/admin/stats?secret=' + encodeURIComponent(adminSecret));
+            if (!res.ok) {
+              if (res.status === 401) {
+                localStorage.removeItem('adminSecret');
+                location.reload();
+              }
+              return;
+            }
+            const data = await res.json();
 
-          // Operations breakdown
-          document.getElementById('launches').textContent = data.transactions.breakdown.launches.toLocaleString();
-          document.getElementById('buys').textContent = data.transactions.breakdown.buys.toLocaleString();
-          document.getElementById('sells').textContent = data.transactions.breakdown.sells.toLocaleString();
+            // Uptime
+            const hours = data.uptime.hours;
+            const uptimeStr = hours >= 24
+              ? (hours / 24).toFixed(1) + ' days'
+              : hours >= 1
+                ? hours.toFixed(1) + ' hours'
+                : Math.floor(data.uptime.seconds / 60) + ' min';
+            document.getElementById('uptime').textContent = uptimeStr;
+            document.getElementById('since').textContent = 'since ' + new Date(data.uptime.since).toLocaleString();
 
-          // Transactions
-          document.getElementById('totalTxs').textContent = data.transactions.total.toLocaleString();
-          document.getElementById('sendTxCalls').textContent = data.transactions.sendTxCalls.toLocaleString();
-          document.getElementById('rpcCalls').textContent = data.rpcCalls.toLocaleString();
+            // Users
+            document.getElementById('uniqueUsers').textContent = data.users.unique.toLocaleString();
 
-          // Metadata
-          document.getElementById('metadataCreated').textContent = data.metadata.created.toLocaleString();
-          document.getElementById('imagesUploaded').textContent = data.metadata.imagesUploaded.toLocaleString();
+            // Volume & Fees
+            document.getElementById('solVolume').textContent = data.volume.totalSolBought.toFixed(4) + ' SOL';
+            document.getElementById('feesEarned').textContent = data.volume.feesEarned.toFixed(4) + ' SOL';
 
-          // Last updated
-          document.getElementById('lastUpdated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
-        } catch (e) {
-          console.error('Failed to load stats:', e);
+            // Operations breakdown
+            document.getElementById('launches').textContent = data.transactions.breakdown.launches.toLocaleString();
+            document.getElementById('buys').textContent = data.transactions.breakdown.buys.toLocaleString();
+            document.getElementById('sells').textContent = data.transactions.breakdown.sells.toLocaleString();
+
+            // Transactions
+            document.getElementById('totalTxs').textContent = data.transactions.total.toLocaleString();
+            document.getElementById('sendTxCalls').textContent = data.transactions.sendTxCalls.toLocaleString();
+            document.getElementById('rpcCalls').textContent = data.rpcCalls.toLocaleString();
+
+            // Metadata
+            document.getElementById('metadataCreated').textContent = data.metadata.created.toLocaleString();
+            document.getElementById('imagesUploaded').textContent = data.metadata.imagesUploaded.toLocaleString();
+
+            // Last updated
+            document.getElementById('lastUpdated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+          } catch (e) {
+            console.error('Failed to load stats:', e);
+          }
         }
       }
-    });
+
+      // Run init immediately or on DOMContentLoaded
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+      } else {
+        init();
+      }
+    })();
   </script>
 </body>
 </html>`);
