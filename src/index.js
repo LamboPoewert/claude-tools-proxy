@@ -71,6 +71,25 @@ app.get('/', (req, res) => {
 
 // ============== ADMIN DASHBOARD (HTML) ==============
 app.get('/admin', (req, res) => {
+  const secret = req.query.secret;
+
+  // Check auth
+  if (!ADMIN_SECRET) {
+    return res.status(503).send('ADMIN_SECRET not configured on server');
+  }
+  if (secret !== ADMIN_SECRET) {
+    return res.status(401).send('Unauthorized. Use /admin?secret=YOUR_SECRET');
+  }
+
+  // Get stats
+  const uptimeSeconds = Math.floor((Date.now() - stats.startTime) / 1000);
+  const uptimeHours = (uptimeSeconds / 3600).toFixed(2);
+  const uptimeStr = uptimeHours >= 24
+    ? (uptimeHours / 24).toFixed(1) + ' days'
+    : uptimeHours >= 1
+      ? parseFloat(uptimeHours).toFixed(1) + ' hours'
+      : Math.floor(uptimeSeconds / 60) + ' min';
+
   res.setHeader('Content-Type', 'text/html');
   res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -78,6 +97,7 @@ app.get('/admin', (req, res) => {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Admin Dashboard - Claude Tools Proxy</title>
+  <meta http-equiv="refresh" content="30">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -86,331 +106,99 @@ app.get('/admin', (req, res) => {
       min-height: 100vh;
       color: #e4e4e7;
     }
-    .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+    .container { max-width: 1200px; margin: 0 auto; padding: 1rem; }
     h1 {
-      font-size: 2rem;
-      margin-bottom: 2rem;
+      font-size: 1.5rem;
+      margin-bottom: 1.5rem;
       color: #22d3ee;
       text-align: center;
-      text-shadow: 0 0 20px rgba(34, 211, 238, 0.3);
     }
-    .login-box {
-      max-width: 400px;
-      margin: 4rem auto;
-      background: rgba(255,255,255,0.05);
-      border: 1px solid rgba(255,255,255,0.1);
-      border-radius: 12px;
-      padding: 2rem;
-      backdrop-filter: blur(10px);
-    }
-    .login-box h2 { margin-bottom: 1.5rem; color: #a5b4fc; text-align: center; }
-    .login-box input {
-      width: 100%;
-      padding: 0.75rem 1rem;
-      border: 1px solid rgba(255,255,255,0.2);
-      border-radius: 8px;
-      background: rgba(0,0,0,0.3);
-      color: #fff;
-      font-size: 1rem;
-      margin-bottom: 1rem;
-    }
-    .login-box input:focus { outline: none; border-color: #22d3ee; }
-    .login-box button {
-      width: 100%;
-      padding: 0.75rem;
-      background: linear-gradient(135deg, #22d3ee, #818cf8);
-      border: none;
-      border-radius: 8px;
-      color: #fff;
-      font-size: 1rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: transform 0.2s, box-shadow 0.2s;
-    }
-    .login-box button:hover { transform: translateY(-2px); box-shadow: 0 4px 20px rgba(34, 211, 238, 0.4); }
-    .error { color: #f87171; text-align: center; margin-top: 1rem; }
-    .dashboard { display: none; }
     .stats-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-      gap: 1.5rem;
-      margin-bottom: 2rem;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1rem;
     }
     .stat-card {
       background: rgba(255,255,255,0.05);
       border: 1px solid rgba(255,255,255,0.1);
       border-radius: 12px;
-      padding: 1.5rem;
-      backdrop-filter: blur(10px);
+      padding: 1rem;
     }
     .stat-card h3 {
-      font-size: 0.875rem;
+      font-size: 0.7rem;
       text-transform: uppercase;
-      letter-spacing: 0.05em;
       color: #94a3b8;
-      margin-bottom: 0.5rem;
+      margin-bottom: 0.25rem;
     }
     .stat-card .value {
-      font-size: 2rem;
+      font-size: 1.25rem;
       font-weight: 700;
       color: #22d3ee;
     }
-    .stat-card .sub { font-size: 0.875rem; color: #64748b; margin-top: 0.25rem; }
+    .stat-card .sub { font-size: 0.7rem; color: #64748b; }
     .stat-card.highlight { border-color: rgba(34, 211, 238, 0.3); background: rgba(34, 211, 238, 0.1); }
     .stat-card.highlight .value { color: #4ade80; }
-    .breakdown { margin-top: 1rem; }
     .breakdown-item {
       display: flex;
       justify-content: space-between;
-      padding: 0.5rem 0;
-      border-bottom: 1px solid rgba(255,255,255,0.05);
+      padding: 0.25rem 0;
+      font-size: 0.85rem;
     }
-    .breakdown-item:last-child { border-bottom: none; }
     .breakdown-item .label { color: #94a3b8; }
     .breakdown-item .val { color: #e4e4e7; font-weight: 600; }
-    .refresh-info { text-align: center; color: #64748b; font-size: 0.875rem; margin-top: 1rem; }
-    .last-updated { text-align: center; color: #64748b; font-size: 0.75rem; margin-top: 0.5rem; }
+    .refresh-info { text-align: center; color: #64748b; font-size: 0.75rem; margin-top: 1rem; }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>Claude Tools Proxy - Admin Dashboard</h1>
+    <h1>Admin Dashboard</h1>
 
-    <form class="login-box" id="loginBox" action="javascript:void(0);">
-      <h2>Enter Admin Secret</h2>
-      <input type="password" id="secretInput" placeholder="Admin secret..." autocomplete="off">
-      <button type="submit" id="loginBtn">Access Dashboard</button>
-      <div class="error" id="loginError"></div>
-    </form>
-
-    <div class="dashboard" id="dashboard">
-      <div class="stats-grid">
-        <div class="stat-card">
-          <h3>Uptime</h3>
-          <div class="value" id="uptime">-</div>
-          <div class="sub" id="since">-</div>
-        </div>
-        <div class="stat-card">
-          <h3>Unique Users</h3>
-          <div class="value" id="uniqueUsers">-</div>
-          <div class="sub">by IP address</div>
-        </div>
-        <div class="stat-card highlight">
-          <h3>Total SOL Volume</h3>
-          <div class="value" id="solVolume">-</div>
-          <div class="sub">from launches + buys</div>
-        </div>
-        <div class="stat-card highlight">
-          <h3>Fees Earned (1%)</h3>
-          <div class="value" id="feesEarned">-</div>
-          <div class="sub">SOL</div>
-        </div>
+    <div class="stats-grid">
+      <div class="stat-card">
+        <h3>Uptime</h3>
+        <div class="value">${uptimeStr}</div>
+        <div class="sub">since ${new Date(stats.startTime).toLocaleDateString()}</div>
       </div>
-
-      <div class="stats-grid">
-        <div class="stat-card">
-          <h3>Operations</h3>
-          <div class="breakdown">
-            <div class="breakdown-item">
-              <span class="label">Launches</span>
-              <span class="val" id="launches">-</span>
-            </div>
-            <div class="breakdown-item">
-              <span class="label">Buys</span>
-              <span class="val" id="buys">-</span>
-            </div>
-            <div class="breakdown-item">
-              <span class="label">Sells</span>
-              <span class="val" id="sells">-</span>
-            </div>
-          </div>
-        </div>
-        <div class="stat-card">
-          <h3>Transactions</h3>
-          <div class="breakdown">
-            <div class="breakdown-item">
-              <span class="label">Total TXs Sent</span>
-              <span class="val" id="totalTxs">-</span>
-            </div>
-            <div class="breakdown-item">
-              <span class="label">Send-TX Calls</span>
-              <span class="val" id="sendTxCalls">-</span>
-            </div>
-            <div class="breakdown-item">
-              <span class="label">RPC Calls</span>
-              <span class="val" id="rpcCalls">-</span>
-            </div>
-          </div>
-        </div>
-        <div class="stat-card">
-          <h3>Metadata</h3>
-          <div class="breakdown">
-            <div class="breakdown-item">
-              <span class="label">Metadata Created</span>
-              <span class="val" id="metadataCreated">-</span>
-            </div>
-            <div class="breakdown-item">
-              <span class="label">Images Uploaded</span>
-              <span class="val" id="imagesUploaded">-</span>
-            </div>
-          </div>
-        </div>
+      <div class="stat-card">
+        <h3>Users</h3>
+        <div class="value">${stats.uniqueUsers.size}</div>
+        <div class="sub">unique IPs</div>
       </div>
-
-      <div class="refresh-info">Auto-refreshes every 30 seconds</div>
-      <div class="last-updated" id="lastUpdated">-</div>
+      <div class="stat-card highlight">
+        <h3>SOL Volume</h3>
+        <div class="value">${stats.totalSolVolume.toFixed(2)}</div>
+        <div class="sub">SOL</div>
+      </div>
+      <div class="stat-card highlight">
+        <h3>Fees (1%)</h3>
+        <div class="value">${stats.totalFeesEarned.toFixed(4)}</div>
+        <div class="sub">SOL</div>
+      </div>
     </div>
+
+    <div class="stat-card" style="margin-bottom:1rem">
+      <h3>Operations</h3>
+      <div class="breakdown-item"><span class="label">Launches</span><span class="val">${stats.launches}</span></div>
+      <div class="breakdown-item"><span class="label">Buys</span><span class="val">${stats.buys}</span></div>
+      <div class="breakdown-item"><span class="label">Sells</span><span class="val">${stats.sells}</span></div>
+    </div>
+
+    <div class="stat-card" style="margin-bottom:1rem">
+      <h3>Transactions</h3>
+      <div class="breakdown-item"><span class="label">Total TXs</span><span class="val">${stats.totalTransactions}</span></div>
+      <div class="breakdown-item"><span class="label">Send-TX Calls</span><span class="val">${stats.totalSendTxCalls}</span></div>
+      <div class="breakdown-item"><span class="label">RPC Calls</span><span class="val">${stats.totalRpcCalls}</span></div>
+    </div>
+
+    <div class="stat-card">
+      <h3>Metadata</h3>
+      <div class="breakdown-item"><span class="label">Created</span><span class="val">${stats.totalMetadataCreated}</span></div>
+      <div class="breakdown-item"><span class="label">Images</span><span class="val">${stats.totalImagesUploaded}</span></div>
+    </div>
+
+    <div class="refresh-info">Auto-refreshes every 30 seconds</div>
   </div>
-
-  <script>
-    (function() {
-      var adminSecret = '';
-      var refreshInterval = null;
-
-      function init() {
-        var secretInput = document.getElementById('secretInput');
-        var loginError = document.getElementById('loginError');
-        var loginBox = document.getElementById('loginBox');
-        var dashboard = document.getElementById('dashboard');
-
-        // Show debug message
-        loginError.textContent = 'JS loaded OK';
-        loginError.style.color = '#4ade80';
-
-        // Attach form submit listener
-        loginBox.onsubmit = function(e) {
-          e.preventDefault();
-          login();
-          return false;
-        };
-
-        // Check localStorage for saved secret
-        var saved = localStorage.getItem('adminSecret');
-        if (saved) {
-          adminSecret = saved;
-          tryAutoLogin();
-        }
-
-        function tryAutoLogin() {
-          fetch('/admin/stats?secret=' + encodeURIComponent(adminSecret))
-            .then(function(res) {
-              if (res.ok) {
-                showDashboard();
-                loadStats();
-              } else {
-                localStorage.removeItem('adminSecret');
-                adminSecret = '';
-              }
-            })
-            .catch(function() {
-              localStorage.removeItem('adminSecret');
-            });
-        }
-
-        function login() {
-          loginError.textContent = 'Logging in...';
-          loginError.style.color = '#22d3ee';
-
-          adminSecret = secretInput.value.trim();
-
-          if (!adminSecret) {
-            loginError.textContent = 'Please enter the admin secret';
-            loginError.style.color = '#f87171';
-            return;
-          }
-
-          fetch('/admin/stats?secret=' + encodeURIComponent(adminSecret))
-            .then(function(res) {
-              if (res.ok) {
-                localStorage.setItem('adminSecret', adminSecret);
-                loginError.textContent = '';
-                showDashboard();
-                loadStats();
-              } else if (res.status === 401) {
-                loginError.textContent = 'Invalid admin secret';
-                loginError.style.color = '#f87171';
-              } else {
-                return res.json().then(function(data) {
-                  loginError.textContent = data.error || 'Error accessing stats';
-                  loginError.style.color = '#f87171';
-                });
-              }
-            })
-            .catch(function(e) {
-              loginError.textContent = 'Network error: ' + e.message;
-              loginError.style.color = '#f87171';
-            });
-        }
-
-        function showDashboard() {
-          loginBox.style.display = 'none';
-          dashboard.style.display = 'block';
-          refreshInterval = setInterval(loadStats, 30000);
-        }
-
-        function loadStats() {
-          fetch('/admin/stats?secret=' + encodeURIComponent(adminSecret))
-            .then(function(res) {
-              if (!res.ok) {
-                if (res.status === 401) {
-                  localStorage.removeItem('adminSecret');
-                  location.reload();
-                }
-                return null;
-              }
-              return res.json();
-            })
-            .then(function(data) {
-              if (!data) return;
-
-              // Uptime
-              var hours = data.uptime.hours;
-              var uptimeStr = hours >= 24
-                ? (hours / 24).toFixed(1) + ' days'
-                : hours >= 1
-                  ? hours.toFixed(1) + ' hours'
-                  : Math.floor(data.uptime.seconds / 60) + ' min';
-              document.getElementById('uptime').textContent = uptimeStr;
-              document.getElementById('since').textContent = 'since ' + new Date(data.uptime.since).toLocaleString();
-
-              // Users
-              document.getElementById('uniqueUsers').textContent = data.users.unique.toLocaleString();
-
-              // Volume & Fees
-              document.getElementById('solVolume').textContent = data.volume.totalSolBought.toFixed(4) + ' SOL';
-              document.getElementById('feesEarned').textContent = data.volume.feesEarned.toFixed(4) + ' SOL';
-
-              // Operations breakdown
-              document.getElementById('launches').textContent = data.transactions.breakdown.launches.toLocaleString();
-              document.getElementById('buys').textContent = data.transactions.breakdown.buys.toLocaleString();
-              document.getElementById('sells').textContent = data.transactions.breakdown.sells.toLocaleString();
-
-              // Transactions
-              document.getElementById('totalTxs').textContent = data.transactions.total.toLocaleString();
-              document.getElementById('sendTxCalls').textContent = data.transactions.sendTxCalls.toLocaleString();
-              document.getElementById('rpcCalls').textContent = data.rpcCalls.toLocaleString();
-
-              // Metadata
-              document.getElementById('metadataCreated').textContent = data.metadata.created.toLocaleString();
-              document.getElementById('imagesUploaded').textContent = data.metadata.imagesUploaded.toLocaleString();
-
-              // Last updated
-              document.getElementById('lastUpdated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
-            })
-            .catch(function(e) {
-              console.error('Failed to load stats:', e);
-            });
-        }
-      }
-
-      // Run init when DOM ready
-      if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
-      } else {
-        init();
-      }
-    })();
-  </script>
 </body>
 </html>`);
 });
