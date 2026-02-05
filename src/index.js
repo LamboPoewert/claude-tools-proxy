@@ -179,7 +179,7 @@ app.get('/admin', (req, res) => {
     <div class="login-box" id="loginBox">
       <h2>Enter Admin Secret</h2>
       <input type="password" id="secretInput" placeholder="Admin secret..." autocomplete="off">
-      <button onclick="login()">Access Dashboard</button>
+      <button type="button" id="loginBtn">Access Dashboard</button>
       <div class="error" id="loginError"></div>
     </div>
 
@@ -378,6 +378,12 @@ app.get('/admin', (req, res) => {
         e.preventDefault();
         login();
       }
+    });
+
+    // Button click to login
+    document.getElementById('loginBtn').addEventListener('click', (e) => {
+      e.preventDefault();
+      login();
     });
   </script>
 </body>
