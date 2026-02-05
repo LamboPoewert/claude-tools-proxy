@@ -69,6 +69,318 @@ app.get('/', (req, res) => {
   });
 });
 
+// ============== ADMIN DASHBOARD (HTML) ==============
+app.get('/admin', (req, res) => {
+  res.setHeader('Content-Type', 'text/html');
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin Dashboard - Claude Tools Proxy</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      min-height: 100vh;
+      color: #e4e4e7;
+    }
+    .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+    h1 {
+      font-size: 2rem;
+      margin-bottom: 2rem;
+      color: #22d3ee;
+      text-align: center;
+      text-shadow: 0 0 20px rgba(34, 211, 238, 0.3);
+    }
+    .login-box {
+      max-width: 400px;
+      margin: 4rem auto;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      padding: 2rem;
+      backdrop-filter: blur(10px);
+    }
+    .login-box h2 { margin-bottom: 1.5rem; color: #a5b4fc; text-align: center; }
+    .login-box input {
+      width: 100%;
+      padding: 0.75rem 1rem;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 8px;
+      background: rgba(0,0,0,0.3);
+      color: #fff;
+      font-size: 1rem;
+      margin-bottom: 1rem;
+    }
+    .login-box input:focus { outline: none; border-color: #22d3ee; }
+    .login-box button {
+      width: 100%;
+      padding: 0.75rem;
+      background: linear-gradient(135deg, #22d3ee, #818cf8);
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .login-box button:hover { transform: translateY(-2px); box-shadow: 0 4px 20px rgba(34, 211, 238, 0.4); }
+    .error { color: #f87171; text-align: center; margin-top: 1rem; }
+    .dashboard { display: none; }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.5rem;
+      margin-bottom: 2rem;
+    }
+    .stat-card {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      padding: 1.5rem;
+      backdrop-filter: blur(10px);
+    }
+    .stat-card h3 {
+      font-size: 0.875rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #94a3b8;
+      margin-bottom: 0.5rem;
+    }
+    .stat-card .value {
+      font-size: 2rem;
+      font-weight: 700;
+      color: #22d3ee;
+    }
+    .stat-card .sub { font-size: 0.875rem; color: #64748b; margin-top: 0.25rem; }
+    .stat-card.highlight { border-color: rgba(34, 211, 238, 0.3); background: rgba(34, 211, 238, 0.1); }
+    .stat-card.highlight .value { color: #4ade80; }
+    .breakdown { margin-top: 1rem; }
+    .breakdown-item {
+      display: flex;
+      justify-content: space-between;
+      padding: 0.5rem 0;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+    .breakdown-item:last-child { border-bottom: none; }
+    .breakdown-item .label { color: #94a3b8; }
+    .breakdown-item .val { color: #e4e4e7; font-weight: 600; }
+    .refresh-info { text-align: center; color: #64748b; font-size: 0.875rem; margin-top: 1rem; }
+    .last-updated { text-align: center; color: #64748b; font-size: 0.75rem; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Claude Tools Proxy - Admin Dashboard</h1>
+
+    <div class="login-box" id="loginBox">
+      <h2>Enter Admin Secret</h2>
+      <input type="password" id="secretInput" placeholder="Admin secret..." autocomplete="off">
+      <button onclick="login()">Access Dashboard</button>
+      <div class="error" id="loginError"></div>
+    </div>
+
+    <div class="dashboard" id="dashboard">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <h3>Uptime</h3>
+          <div class="value" id="uptime">-</div>
+          <div class="sub" id="since">-</div>
+        </div>
+        <div class="stat-card">
+          <h3>Unique Users</h3>
+          <div class="value" id="uniqueUsers">-</div>
+          <div class="sub">by IP address</div>
+        </div>
+        <div class="stat-card highlight">
+          <h3>Total SOL Volume</h3>
+          <div class="value" id="solVolume">-</div>
+          <div class="sub">from launches + buys</div>
+        </div>
+        <div class="stat-card highlight">
+          <h3>Fees Earned (1%)</h3>
+          <div class="value" id="feesEarned">-</div>
+          <div class="sub">SOL</div>
+        </div>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card">
+          <h3>Operations</h3>
+          <div class="breakdown">
+            <div class="breakdown-item">
+              <span class="label">Launches</span>
+              <span class="val" id="launches">-</span>
+            </div>
+            <div class="breakdown-item">
+              <span class="label">Buys</span>
+              <span class="val" id="buys">-</span>
+            </div>
+            <div class="breakdown-item">
+              <span class="label">Sells</span>
+              <span class="val" id="sells">-</span>
+            </div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <h3>Transactions</h3>
+          <div class="breakdown">
+            <div class="breakdown-item">
+              <span class="label">Total TXs Sent</span>
+              <span class="val" id="totalTxs">-</span>
+            </div>
+            <div class="breakdown-item">
+              <span class="label">Send-TX Calls</span>
+              <span class="val" id="sendTxCalls">-</span>
+            </div>
+            <div class="breakdown-item">
+              <span class="label">RPC Calls</span>
+              <span class="val" id="rpcCalls">-</span>
+            </div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <h3>Metadata</h3>
+          <div class="breakdown">
+            <div class="breakdown-item">
+              <span class="label">Metadata Created</span>
+              <span class="val" id="metadataCreated">-</span>
+            </div>
+            <div class="breakdown-item">
+              <span class="label">Images Uploaded</span>
+              <span class="val" id="imagesUploaded">-</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="refresh-info">Auto-refreshes every 30 seconds</div>
+      <div class="last-updated" id="lastUpdated">-</div>
+    </div>
+  </div>
+
+  <script>
+    let adminSecret = '';
+    let refreshInterval = null;
+
+    // Check localStorage for saved secret
+    const saved = localStorage.getItem('adminSecret');
+    if (saved) {
+      adminSecret = saved;
+      tryAutoLogin();
+    }
+
+    async function tryAutoLogin() {
+      try {
+        const res = await fetch('/admin/stats?secret=' + encodeURIComponent(adminSecret));
+        if (res.ok) {
+          showDashboard();
+          loadStats();
+        } else {
+          localStorage.removeItem('adminSecret');
+          adminSecret = '';
+        }
+      } catch (e) {
+        localStorage.removeItem('adminSecret');
+      }
+    }
+
+    async function login() {
+      const input = document.getElementById('secretInput');
+      const error = document.getElementById('loginError');
+      adminSecret = input.value.trim();
+
+      if (!adminSecret) {
+        error.textContent = 'Please enter the admin secret';
+        return;
+      }
+
+      try {
+        const res = await fetch('/admin/stats?secret=' + encodeURIComponent(adminSecret));
+        if (res.ok) {
+          localStorage.setItem('adminSecret', adminSecret);
+          error.textContent = '';
+          showDashboard();
+          loadStats();
+        } else if (res.status === 401) {
+          error.textContent = 'Invalid admin secret';
+        } else {
+          const data = await res.json();
+          error.textContent = data.error || 'Error accessing stats';
+        }
+      } catch (e) {
+        error.textContent = 'Network error';
+      }
+    }
+
+    function showDashboard() {
+      document.getElementById('loginBox').style.display = 'none';
+      document.getElementById('dashboard').style.display = 'block';
+      refreshInterval = setInterval(loadStats, 30000);
+    }
+
+    async function loadStats() {
+      try {
+        const res = await fetch('/admin/stats?secret=' + encodeURIComponent(adminSecret));
+        if (!res.ok) {
+          if (res.status === 401) {
+            localStorage.removeItem('adminSecret');
+            location.reload();
+          }
+          return;
+        }
+        const data = await res.json();
+
+        // Uptime
+        const hours = data.uptime.hours;
+        const uptimeStr = hours >= 24
+          ? (hours / 24).toFixed(1) + ' days'
+          : hours >= 1
+            ? hours.toFixed(1) + ' hours'
+            : Math.floor(data.uptime.seconds / 60) + ' min';
+        document.getElementById('uptime').textContent = uptimeStr;
+        document.getElementById('since').textContent = 'since ' + new Date(data.uptime.since).toLocaleString();
+
+        // Users
+        document.getElementById('uniqueUsers').textContent = data.users.unique.toLocaleString();
+
+        // Volume & Fees
+        document.getElementById('solVolume').textContent = data.volume.totalSolBought.toFixed(4) + ' SOL';
+        document.getElementById('feesEarned').textContent = data.volume.feesEarned.toFixed(4) + ' SOL';
+
+        // Operations breakdown
+        document.getElementById('launches').textContent = data.transactions.breakdown.launches.toLocaleString();
+        document.getElementById('buys').textContent = data.transactions.breakdown.buys.toLocaleString();
+        document.getElementById('sells').textContent = data.transactions.breakdown.sells.toLocaleString();
+
+        // Transactions
+        document.getElementById('totalTxs').textContent = data.transactions.total.toLocaleString();
+        document.getElementById('sendTxCalls').textContent = data.transactions.sendTxCalls.toLocaleString();
+        document.getElementById('rpcCalls').textContent = data.rpcCalls.toLocaleString();
+
+        // Metadata
+        document.getElementById('metadataCreated').textContent = data.metadata.created.toLocaleString();
+        document.getElementById('imagesUploaded').textContent = data.metadata.imagesUploaded.toLocaleString();
+
+        // Last updated
+        document.getElementById('lastUpdated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+      } catch (e) {
+        console.error('Failed to load stats:', e);
+      }
+    }
+
+    // Enter key to login
+    document.getElementById('secretInput').addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') login();
+    });
+  </script>
+</body>
+</html>`);
+});
+
 // ============== ADMIN STATS ENDPOINT ==============
 app.get('/admin/stats', (req, res) => {
   // Check auth — require ?secret=ADMIN_SECRET or Authorization header
