@@ -176,12 +176,12 @@ app.get('/admin', (req, res) => {
   <div class="container">
     <h1>Claude Tools Proxy - Admin Dashboard</h1>
 
-    <div class="login-box" id="loginBox">
+    <form class="login-box" id="loginBox" action="javascript:void(0);">
       <h2>Enter Admin Secret</h2>
       <input type="password" id="secretInput" placeholder="Admin secret..." autocomplete="off">
-      <button type="button" id="loginBtn">Access Dashboard</button>
+      <button type="submit" id="loginBtn">Access Dashboard</button>
       <div class="error" id="loginError"></div>
-    </div>
+    </form>
 
     <div class="dashboard" id="dashboard">
       <div class="stats-grid">
@@ -274,16 +274,10 @@ app.get('/admin', (req, res) => {
         const loginBox = document.getElementById('loginBox');
         const dashboard = document.getElementById('dashboard');
 
-        // Attach event listeners
-        loginBtn.addEventListener('click', function() {
+        // Attach form submit listener (handles both button click and Enter key)
+        loginBox.addEventListener('submit', function(e) {
+          e.preventDefault();
           login();
-        });
-
-        secretInput.addEventListener('keydown', function(e) {
-          if (e.key === 'Enter') {
-            e.preventDefault();
-            login();
-          }
         });
 
         // Check localStorage for saved secret
