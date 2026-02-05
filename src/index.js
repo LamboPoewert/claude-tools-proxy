@@ -263,19 +263,24 @@ app.get('/admin', (req, res) => {
   </div>
 
   <script>
+    alert('Script started');
     (function() {
       let adminSecret = '';
       let refreshInterval = null;
 
       function init() {
+        alert('Init called');
         const secretInput = document.getElementById('secretInput');
         const loginBtn = document.getElementById('loginBtn');
         const loginError = document.getElementById('loginError');
         const loginBox = document.getElementById('loginBox');
         const dashboard = document.getElementById('dashboard');
 
+        alert('Elements found: ' + (loginBox ? 'yes' : 'no'));
+
         // Attach form submit listener (handles both button click and Enter key)
         loginBox.addEventListener('submit', function(e) {
+          alert('Form submitted!');
           e.preventDefault();
           login();
         });
