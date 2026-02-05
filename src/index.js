@@ -373,8 +373,11 @@ app.get('/admin', (req, res) => {
     }
 
     // Enter key to login
-    document.getElementById('secretInput').addEventListener('keypress', (e) => {
-      if (e.key === 'Enter') login();
+    document.getElementById('secretInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        login();
+      }
     });
   </script>
 </body>
